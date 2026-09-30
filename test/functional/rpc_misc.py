@@ -11,9 +11,8 @@ from test_framework.util import (
     assert_equal,
     assert_greater_than,
     assert_greater_than_or_equal,
+    JSONRPCException,
 )
-
-from test_framework.authproxy import JSONRPCException
 
 import http
 import subprocess
@@ -100,7 +99,7 @@ class RpcMiscTest(BitcoinTestFramework):
         assert_equal(node.getindexinfo(), {})
 
         # Restart the node with indices and wait for them to sync
-        self.restart_node(0, ["-txindex", "-blockfilterindex", "-coinstatsindex"])
+        self.restart_node(0, ["-txindex", "-blockfilterindex", "-coinstatsindex", "-txospenderindex"])
         self.wait_until(lambda: all(i["synced"] for i in node.getindexinfo().values()))
 
         # Returns a list of all running indices by default
@@ -111,14 +110,28 @@ class RpcMiscTest(BitcoinTestFramework):
                 "txindex": values,
                 "basic block filter index": values,
                 "coinstatsindex": values,
+                "txospenderindex": values,
             }
         )
         # Specifying an index by name returns only the status of that index
-        for i in {"txindex", "basic block filter index", "coinstatsindex"}:
+        for i in {"txindex", "basic block filter index", "coinstatsindex", "txospenderindex"}:
             assert_equal(node.getindexinfo(i), {i: values})
 
         # Specifying an unknown index name returns an empty result
         assert_equal(node.getindexinfo("foo"), {})
+
+        # Test a deprecated category
+        all_result = node.logging(include=['all'])
+        assert_equal(True, all(enabled is True for category, enabled in all_result.items()))
+        assert_equal(True, 'libevent' not in all_result)
+        assert_equal(all_result, node.logging())
+        libevent_warning = "The logging category `libevent` is deprecated"
+        with self.nodes[0].assert_debug_log([libevent_warning]):
+            assert_equal(all_result, node.logging(include=['libevent']))
+        assert_equal(all_result, node.logging())
+        with self.nodes[0].assert_debug_log([libevent_warning]):
+            assert_equal(all_result, node.logging(exclude=['libevent']))
+        assert_equal(all_result, node.logging())
 
 
 if __name__ == '__main__':

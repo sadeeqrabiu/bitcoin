@@ -36,10 +36,10 @@ Documentation for C++ subprocessing library.
 #ifndef BITCOIN_UTIL_SUBPROCESS_H
 #define BITCOIN_UTIL_SUBPROCESS_H
 
+#include <util/check.h>
 #include <util/syserror.h>
 
 #include <algorithm>
-#include <cassert>
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
@@ -48,26 +48,16 @@ Documentation for C++ subprocessing library.
 #include <future>
 #include <initializer_list>
 #include <iostream>
-#include <locale>
 #include <map>
 #include <memory>
 #include <sstream>
 #include <string>
 #include <vector>
 
-#if (defined _MSC_VER) || (defined __MINGW32__)
-  #define __USING_WINDOWS__
-#endif
-
-#ifdef __USING_WINDOWS__
-  #include <codecvt>
-#endif
-
 extern "C" {
-#ifdef __USING_WINDOWS__
+#ifdef WIN32
   #include <windows.h>
   #include <io.h>
-  #include <cwchar>
 #else
   #include <sys/wait.h>
   #include <unistd.h>
@@ -120,12 +110,12 @@ namespace subprocess {
 
 // Max buffer size allocated on stack for read error
 // from pipe
-static const size_t SP_MAX_ERR_BUF_SIZ = 1024;
+inline constexpr size_t SP_MAX_ERR_BUF_SIZ = 1024;
 
 // Default buffer capacity for OutBuffer and ErrBuffer.
 // If the data exceeds this capacity, the buffer size is grown
 // by 1.5 times its previous capacity
-static const size_t DEFAULT_BUF_CAP_BYTES = 8192;
+inline constexpr size_t DEFAULT_BUF_CAP_BYTES = 8192;
 
 
 /*-----------------------------------------------
@@ -171,10 +161,13 @@ public:
 //--------------------------------------------------------------------
 namespace util
 {
-#ifdef __USING_WINDOWS__
-  inline void quote_argument(const std::wstring &argument, std::wstring &command_line,
+#ifdef WIN32
+  inline void quote_argument(const std::string &argument, std::string &command_line,
                       bool force)
   {
+    constexpr char quote = '"';
+    constexpr char backslash = '\\';
+
     //
     // Unless we're told otherwise, don't quote unless we actually
     // need to do so --- hopefully avoid problems if programs won't
@@ -182,16 +175,16 @@ namespace util
     //
 
     if (force == false && argument.empty() == false &&
-        argument.find_first_of(L" \t\n\v") == argument.npos) {
+        argument.find_first_of(" \t\n\v") == argument.npos) {
       command_line.append(argument);
     }
     else {
-      command_line.push_back(L'"');
+      command_line.push_back(quote);
 
       for (auto it = argument.begin();; ++it) {
         unsigned number_backslashes = 0;
 
-        while (it != argument.end() && *it == L'\\') {
+        while (it != argument.end() && *it == backslash) {
           ++it;
           ++number_backslashes;
         }
@@ -204,17 +197,17 @@ namespace util
           // as a metacharacter.
           //
 
-          command_line.append(number_backslashes * 2, L'\\');
+          command_line.append(number_backslashes * 2, backslash);
           break;
         }
-        else if (*it == L'"') {
+        else if (*it == quote) {
 
           //
           // Escape all backslashes and the following
           // double quotation mark.
           //
 
-          command_line.append(number_backslashes * 2 + 1, L'\\');
+          command_line.append(number_backslashes * 2 + 1, backslash);
           command_line.push_back(*it);
         }
         else {
@@ -223,12 +216,12 @@ namespace util
           // Backslashes aren't special here.
           //
 
-          command_line.append(number_backslashes, L'\\');
+          command_line.append(number_backslashes, backslash);
           command_line.push_back(*it);
         }
       }
 
-      command_line.push_back(L'"');
+      command_line.push_back(quote);
     }
   }
 
@@ -332,7 +325,7 @@ namespace util
   }
 
 
-#ifndef __USING_WINDOWS__
+#ifndef WIN32
   /*!
    * Function: set_clo_on_exec
    * Sets/Resets the FD_CLOEXEC flag on the provided file descriptor
@@ -424,7 +417,7 @@ namespace util
   static inline
   int read_atmost_n(FILE* fp, char* buf, size_t read_upto)
   {
-#ifdef __USING_WINDOWS__
+#ifdef WIN32
     return (int)fread(buf, 1, read_upto, fp);
 #else
     int fd = subprocess_fileno(fp);
@@ -497,7 +490,7 @@ namespace util
     return total_bytes_read;
   }
 
-#ifndef __USING_WINDOWS__
+#ifndef WIN32
   /*!
    * Function: wait_for_child_exit
    * Waits for the process with pid `pid` to exit
@@ -598,7 +591,7 @@ struct input
   }
   explicit input(IOTYPE typ) {
     assert (typ == PIPE && "STDOUT/STDERR not allowed");
-#ifndef __USING_WINDOWS__
+#ifndef WIN32
     std::tie(rd_ch_, wr_ch_) = util::pipe_cloexec();
 #endif
   }
@@ -631,7 +624,7 @@ struct output
   }
   explicit output(IOTYPE typ) {
     assert (typ == PIPE && "STDOUT/STDERR not allowed");
-#ifndef __USING_WINDOWS__
+#ifndef WIN32
     std::tie(rd_ch_, wr_ch_) = util::pipe_cloexec();
 #endif
   }
@@ -663,7 +656,7 @@ struct error
   explicit error(IOTYPE typ) {
     assert ((typ == PIPE || typ == STDOUT) && "STDERR not allowed");
     if (typ == PIPE) {
-#ifndef __USING_WINDOWS__
+#ifndef WIN32
       std::tie(rd_ch_, wr_ch_) = util::pipe_cloexec();
 #endif
     } else {
@@ -738,6 +731,7 @@ private:
   Popen* popen_ = nullptr;
 };
 
+#ifndef WIN32
 /*!
  * A helper class to Popen.
  * This takes care of all the fork-exec logic
@@ -759,6 +753,7 @@ private:
   Popen* parent_ = nullptr;
   int err_wr_pipe_ = -1;
 };
+#endif
 
 // Fwd Decl.
 class Streams;
@@ -880,7 +875,7 @@ public:// Yes they are public
   std::shared_ptr<FILE> output_ = nullptr;
   std::shared_ptr<FILE> error_  = nullptr;
 
-#ifdef __USING_WINDOWS__
+#ifdef WIN32
   HANDLE g_hChildStd_IN_Rd = nullptr;
   HANDLE g_hChildStd_IN_Wr = nullptr;
   HANDLE g_hChildStd_OUT_Rd = nullptr;
@@ -920,8 +915,6 @@ private:
  * API's provided by the class:
  * Popen({"cmd"}, output{..}, error{..}, ....)
  *    Command provided as a sequence.
- * Popen("cmd arg1", output{..}, error{..}, ....)
- *    Command provided in a single string.
  * wait()             - Wait for the child to exit.
  * retcode()          - The return code of the exited child.
  * send(...)          - Send input to the input channel of the child.
@@ -932,20 +925,9 @@ class Popen
 {
 public:
   friend struct detail::ArgumentDeducer;
+#ifndef WIN32
   friend class detail::Child;
-
-  template <typename... Args>
-  Popen(const std::string& cmd_args, Args&& ...args):
-    args_(cmd_args)
-  {
-    vargs_ = util::split(cmd_args);
-    init_args(std::forward<Args>(args)...);
-
-    // Setup the communication channels of the Popen class
-    stream_.setup_comm_channels();
-
-    execute_process();
-  }
+#endif
 
   template <typename... Args>
   Popen(std::initializer_list<const char*> cmd_args, Args&& ...args)
@@ -1021,21 +1003,19 @@ private:
 private:
   detail::Streams stream_;
 
-#ifdef __USING_WINDOWS__
+#ifdef WIN32
   HANDLE process_handle_;
   std::future<void> cleanup_future_;
+#else
+  // Pid of the child process
+  int child_pid_ = -1;
 #endif
 
   std::string exe_name_;
 
-  // Command in string format
-  std::string args_;
   // Command provided as sequence
   std::vector<std::string> vargs_;
   std::vector<char*> cargv_;
-
-  // Pid of the child process
-  int child_pid_ = -1;
 
   int retcode_ = -1;
 };
@@ -1062,7 +1042,7 @@ inline void Popen::populate_c_argv()
 
 inline int Popen::wait() noexcept(false)
 {
-#ifdef __USING_WINDOWS__
+#ifdef WIN32
   int ret = WaitForSingleObject(process_handle_, INFINITE);
 
   // WaitForSingleObject with INFINITE should only return when process has signaled
@@ -1095,44 +1075,43 @@ inline int Popen::wait() noexcept(false)
 
 inline void Popen::execute_process() noexcept(false)
 {
-#ifdef __USING_WINDOWS__
+#ifdef WIN32
   if (exe_name_.length()) {
     this->vargs_.insert(this->vargs_.begin(), this->exe_name_);
     this->populate_c_argv();
   }
   this->exe_name_ = vargs_[0];
 
-  std::wstring_convert<std::codecvt_utf8_utf16<wchar_t>> converter;
-  std::wstring argument;
-  std::wstring command_line;
+  std::string argument;
+  std::string command_line;
   bool first_arg = true;
 
   for (auto arg : this->vargs_) {
     if (!first_arg) {
-      command_line += L" ";
+      command_line += " ";
     } else {
       first_arg = false;
     }
-    argument = converter.from_bytes(arg);
-    util::quote_argument(argument, command_line, false);
+    argument = arg;
+    util::quote_argument(argument, command_line, /*force=*/false);
   }
 
-  // CreateProcessW can modify szCmdLine so we allocate needed memory
-  wchar_t *szCmdline = new wchar_t[command_line.size() + 1];
-  wcscpy_s(szCmdline, command_line.size() + 1, command_line.c_str());
+  // CreateProcessA can modify szCmdLine so we allocate needed memory
+  char *szCmdline = new char[command_line.size() + 1];
+  strcpy_s(szCmdline, command_line.size() + 1, command_line.c_str());
   PROCESS_INFORMATION piProcInfo;
-  STARTUPINFOW siStartInfo;
+  STARTUPINFOA siStartInfo;
   BOOL bSuccess = FALSE;
-  DWORD creation_flags = CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW;
+  DWORD creation_flags = CREATE_NO_WINDOW;
 
   // Set up members of the PROCESS_INFORMATION structure.
   ZeroMemory(&piProcInfo, sizeof(PROCESS_INFORMATION));
 
-  // Set up members of the STARTUPINFOW structure.
+  // Set up members of the STARTUPINFOA structure.
   // This structure specifies the STDIN and STDOUT handles for redirection.
 
-  ZeroMemory(&siStartInfo, sizeof(STARTUPINFOW));
-  siStartInfo.cb = sizeof(STARTUPINFOW);
+  ZeroMemory(&siStartInfo, sizeof(STARTUPINFOA));
+  siStartInfo.cb = sizeof(STARTUPINFOA);
 
   siStartInfo.hStdError = this->stream_.g_hChildStd_ERR_Wr;
   siStartInfo.hStdOutput = this->stream_.g_hChildStd_OUT_Wr;
@@ -1141,7 +1120,7 @@ inline void Popen::execute_process() noexcept(false)
   siStartInfo.dwFlags |= STARTF_USESTDHANDLES;
 
   // Create the child process.
-  bSuccess = CreateProcessW(NULL,
+  bSuccess = CreateProcessA(NULL,
                             szCmdline,    // command line
                             NULL,         // process security attributes
                             NULL,         // primary thread security attributes
@@ -1149,7 +1128,7 @@ inline void Popen::execute_process() noexcept(false)
                             creation_flags, // creation flags
                             NULL,         // use parent's environment
                             NULL,         // use parent's current directory
-                            &siStartInfo, // STARTUPINFOW pointer
+                            &siStartInfo, // STARTUPINFOA pointer
                             &piProcInfo); // receives PROCESS_INFORMATION
 
   // If an error occurs, exit the application.
@@ -1275,8 +1254,8 @@ namespace detail {
   }
 
 
+#ifndef WIN32
   inline void Child::execute_child() {
-#ifndef __USING_WINDOWS__
     int sys_ret = -1;
     auto& stream = parent_->stream_;
 
@@ -1336,13 +1315,13 @@ namespace detail {
     // Calling application would not get this
     // exit failure
     _exit (EXIT_FAILURE);
-#endif
   }
+#endif
 
 
   inline void Streams::setup_comm_channels()
   {
-#ifdef __USING_WINDOWS__
+#ifdef WIN32
     util::configure_pipe(&this->g_hChildStd_IN_Rd, &this->g_hChildStd_IN_Wr, &this->g_hChildStd_IN_Wr);
     this->input(util::file_from_handle(this->g_hChildStd_IN_Wr, "w"));
     this->write_to_child_ = subprocess_fileno(this->input());

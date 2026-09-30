@@ -6,7 +6,6 @@
 
 from decimal import Decimal, getcontext
 
-from test_framework.authproxy import JSONRPCException
 from test_framework.messages import (
     COIN,
     CTransaction,
@@ -19,11 +18,16 @@ from test_framework.script import (
 
 from test_framework.script_util import bulk_vout
 
+from test_framework.blocktools import (
+    create_empty_fork,
+)
+
 from test_framework.test_framework import BitcoinTestFramework
 from test_framework.util import (
     assert_equal,
     assert_greater_than,
     assert_raises_rpc_error,
+    JSONRPCException,
 )
 
 from test_framework.mempool_util import (
@@ -34,28 +38,27 @@ from test_framework.mempool_util import (
 # sweep alice and bob's wallets and clear the mempool
 def cleanup(func):
     def wrapper(self, *args):
-        try:
-            self.generate(self.nodes[0], 1)
-            func(self, *args)
-        finally:
-            self.generate(self.nodes[0], 1)
+        self.generate(self.nodes[0], 1)
+        func(self, *args)
+
+        self.generate(self.nodes[0], 1)
+        for wallet in [self.alice, self.bob]:
+            txs = set(tx["txid"] for tx in wallet.listtransactions("*", 1000) if tx["confirmations"] == 0 and not tx["abandoned"])
+            for tx in txs:
+                wallet.abandontransaction(tx)
             try:
-                self.alice.sendall([self.charlie.getnewaddress()])
+                wallet.sendall([self.charlie.getnewaddress()])
             except JSONRPCException as e:
                 assert "Total value of UTXO pool too low to pay for transaction" in e.error['message']
-            try:
-                self.bob.sendall([self.charlie.getnewaddress()])
-            except JSONRPCException as e:
-                assert "Total value of UTXO pool too low to pay for transaction" in e.error['message']
-            self.generate(self.nodes[0], 1)
+        self.generate(self.nodes[0], 1)
 
-            for wallet in [self.alice, self.bob]:
-                balance = wallet.getbalances()["mine"]
-                for balance_type in ["untrusted_pending", "trusted", "immature"]:
-                    assert_equal(balance[balance_type], 0)
+        for wallet in [self.alice, self.bob]:
+            balance = wallet.getbalances()["mine"]
+            for balance_type in ["untrusted_pending", "trusted", "immature", "nonmempool"]:
+                assert_equal(balance[balance_type], 0)
 
-            assert_equal(self.alice.getrawmempool(), [])
-            assert_equal(self.bob.getrawmempool(), [])
+        assert_equal(self.alice.getrawmempool(), [])
+        assert_equal(self.bob.getrawmempool(), [])
 
     return wrapper
 
@@ -83,6 +86,12 @@ class WalletV3Test(BitcoinTestFramework):
     def run_test_with_swapped_versions(self, test_func):
         test_func(2, 3)
         test_func(3, 2)
+
+    def trigger_reorg(self, fork_blocks):
+        """Trigger reorg of the fork blocks."""
+        for block in fork_blocks:
+            self.nodes[0].submitblock(block.serialize().hex())
+        assert_equal(self.nodes[0].getbestblockhash(), fork_blocks[-1].hash_hex)
 
     def run_test(self):
         self.nodes[0].createwallet("alice")
@@ -120,6 +129,7 @@ class WalletV3Test(BitcoinTestFramework):
         self.mix_non_truc_versions()
         self.cant_spend_multiple_unconfirmed_truc_outputs()
         self.test_spend_third_generation()
+        self.test_coins_availability_reorg()
 
     @cleanup
     def tx_spends_unconfirmed_tx_with_wrong_version(self, version_a, version_b):
@@ -437,7 +447,7 @@ class WalletV3Test(BitcoinTestFramework):
 
         outputs = {self.alice.getnewaddress() : 10}
         psbt = self.charlie.createpsbt(inputs=[], outputs=outputs, version=3)
-        assert_equal(self.charlie.decodepsbt(psbt)["tx"]["version"], 3)
+        assert_equal(self.charlie.decodepsbt(psbt)["tx_version"], 3)
 
     @cleanup
     def send_v3(self):
@@ -515,7 +525,7 @@ class WalletV3Test(BitcoinTestFramework):
 
         outputs = {self.alice.getnewaddress() : 10}
         psbt = self.charlie.walletcreatefundedpsbt(inputs=[], outputs=outputs, version=3)["psbt"]
-        assert_equal(self.charlie.decodepsbt(psbt)["tx"]["version"], 3)
+        assert_equal(self.charlie.decodepsbt(psbt)["tx_version"], 3)
 
     @cleanup
     def sendall_truc_weight_limit(self):
@@ -629,6 +639,101 @@ class WalletV3Test(BitcoinTestFramework):
                 [self.alice.getnewaddress()],
                 version=3
         )
+
+    @cleanup
+    def test_coins_availability_reorg(self):
+        self.log.info("Test coin availability after reorg with v2 parent and truc child")
+
+        # Prep fork blocks
+        fork_blocks = create_empty_fork(self.nodes[0])
+
+        # Send funds to alice so she can create transactions
+        outputs = {self.alice.getnewaddress(): 5.0}
+        self.send_tx(self.charlie, [], outputs, 2)
+        self.generate(self.nodes[0], 1)
+
+        # Alice creates a v2 transaction with 2 outputs
+        alice_unspent = self.alice.listunspent()[0]
+        v2_outputs = [
+            {self.alice.getnewaddress(): 2.5},
+            {self.alice.getnewaddress(): 2.4999},
+        ]
+        v2_txid = self.send_tx(self.alice, [alice_unspent], v2_outputs, 2)
+
+        # Mine the v2 transaction in one block
+        self.generate(self.nodes[0], 1)
+
+        # Get the output from the v2 transaction for chaining
+        v2_utxo = self.alice.listunspent(minconf=1)[0]
+        assert_equal(v2_utxo["txid"], v2_txid)
+
+        # Alice creates a truc child chaining from the v2 utxo
+        truc_outputs = {self.alice.getnewaddress(): v2_utxo["amount"] - Decimal("0.0001")}
+        truc_txid = self.send_tx(self.alice, [v2_utxo], truc_outputs, 3)
+
+        # Mine the truc transaction in a second block
+        self.generate(self.nodes[0], 1)
+
+        # Verify both transactions are confirmed
+        wallet_tx_v2 = self.alice.gettransaction(v2_txid)
+        wallet_tx_truc = self.alice.gettransaction(truc_txid)
+
+        assert_equal(wallet_tx_v2["confirmations"], 2)
+        assert_equal(wallet_tx_truc["confirmations"], 1)
+
+        # Check that their versions are correct
+        assert_equal(self.alice.decoderawtransaction(wallet_tx_v2["hex"])["version"], 2)
+        assert_equal(self.alice.decoderawtransaction(wallet_tx_truc["hex"])["version"], 3)
+
+        # Check listunspent before reorg - should have the truc output
+        unspent_before = self.alice.listunspent()
+        truc_output_txids = [u["txid"] for u in unspent_before]
+        assert truc_txid in truc_output_txids
+
+        # Trigger the reorg
+        self.trigger_reorg(fork_blocks)
+        # The TRUC transaction is now in a cluster of size 3, which is only permitted in a reorg.
+        assert_equal(self.nodes[0].getmempoolcluster(truc_txid)["txcount"], 3)
+
+        # After reorg, both transactions should be back in mempool
+        mempool = self.nodes[0].getrawmempool()
+        assert v2_txid in mempool
+        assert truc_txid in mempool
+
+        # Check listunspent after reorg - the truc output should still appear
+        # as unconfirmed since the transaction is in the mempool
+        unspent_after = self.alice.listunspent(minconf=0)
+        unspent_txids_after = [u["txid"] for u in unspent_after]
+        assert truc_txid in unspent_txids_after
+
+        total_unconfirmed_amount = sum([u["amount"] for u in self.alice.listunspent(minconf=0)])
+        # We cannot create a transaction spending both outputs, regardless of version.
+        output_too_high = {self.bob.getnewaddress(): total_unconfirmed_amount - Decimal("1")}
+        for version in [2, 3]:
+            raw_output_too_high = self.alice.createrawtransaction(inputs=[], outputs=output_too_high, version=version)
+            assert_raises_rpc_error(
+                    -4,
+                    "Insufficient funds",
+                    self.alice.fundrawtransaction,
+                    raw_output_too_high,
+                    {'include_unsafe' : True}
+            )
+
+        # Now try to create a v2 transaction - this triggers AvailableCoins with
+        # check_version_trucness=true. The v2 parent has truc_child_in_mempool set
+        # because the truc child is in mempool.
+        new_v2_outputs = {self.bob.getnewaddress(): 0.1}
+        raw_v2_child = self.alice.createrawtransaction(inputs=[], outputs=new_v2_outputs, version=2)
+        raw_v2_with_v3_sibling = self.alice.fundrawtransaction(raw_v2_child, {'include_unsafe': True})
+
+        # See that this transaction can be added to mempool
+        signed_raw_v2_with_v3_sibling = self.alice.signrawtransactionwithwallet(raw_v2_with_v3_sibling["hex"])
+        self.alice.sendrawtransaction(signed_raw_v2_with_v3_sibling["hex"])
+
+        # This TRUC transaction is in a cluster of size 4
+        assert_equal(self.nodes[0].getmempoolcluster(truc_txid)["txcount"], 4)
+
+
 
 if __name__ == '__main__':
     WalletV3Test(__file__).main()

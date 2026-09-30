@@ -12,6 +12,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <utility>
 #include <vector>
 
@@ -65,4 +66,4 @@ static void CCheckQueueSpeedPrevectorJob(benchmark::Bench& bench)
         control.Complete();
     });
 }
-BENCHMARK(CCheckQueueSpeedPrevectorJob, benchmark::PriorityLevel::HIGH);
+BENCHMARK(CCheckQueueSpeedPrevectorJob);

@@ -2,25 +2,34 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
-#include <consensus/consensus.h>
+#include <addrman.h>
+#include <banman.h>
+#include <kernel/chainparams.h>
 #include <net.h>
 #include <net_processing.h>
-#include <node/warnings.h>
+#include <primitives/block.h>
+#include <primitives/transaction.h>
 #include <protocol.h>
-#include <script/script.h>
 #include <sync.h>
 #include <test/fuzz/FuzzedDataProvider.h>
 #include <test/fuzz/fuzz.h>
 #include <test/fuzz/util.h>
 #include <test/fuzz/util/net.h>
-#include <test/util/mining.h>
 #include <test/util/net.h>
+#include <test/util/random.h>
 #include <test/util/setup_common.h>
+#include <test/util/time.h>
 #include <test/util/validation.h>
+#include <uint256.h>
+#include <util/check.h>
 #include <util/time.h>
+#include <validation.h>
 #include <validationinterface.h>
 
+#include <functional>
 #include <ios>
+#include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -28,28 +37,22 @@
 namespace {
 TestingSetup* g_setup;
 
-void ResetChainman(TestingSetup& setup)
-{
-    SetMockTime(setup.m_node.chainman->GetParams().GenesisBlock().Time());
-    setup.m_node.chainman.reset();
-    setup.m_make_chainman();
-    setup.LoadVerifyActivateChainstate();
-    for (int i = 0; i < 2 * COINBASE_MATURITY; i++) {
-        MineBlock(setup.m_node, {});
-    }
-    setup.m_node.validation_signals->SyncWithValidationInterfaceQueue();
-}
 } // namespace
+
+extern void MakeRandDeterministicDANGEROUS(const uint256& seed) noexcept;
 
 void initialize_process_messages()
 {
+    FakeNodeClock init_clock{}; // Uses the existing mock time
     static const auto testing_setup{
         MakeNoLogFileContext<TestingSetup>(
             /*chain_type=*/ChainType::REGTEST,
             {}),
     };
     g_setup = testing_setup.get();
-    ResetChainman(*g_setup);
+    // Replace validation_signals before creating chainman and mempool so they use it.
+    g_setup->m_node.validation_signals = std::make_unique<ValidationSignals>(std::make_unique<ImmediateBackgroundTaskRunner>());
+    ResetChainmanAndMempool(*g_setup, init_clock);
 }
 
 FUZZ_TARGET(process_messages, .init = initialize_process_messages)
@@ -57,33 +60,40 @@ FUZZ_TARGET(process_messages, .init = initialize_process_messages)
     SeedRandomStateForTest(SeedRand::ZEROS);
     FuzzedDataProvider fuzzed_data_provider(buffer.data(), buffer.size());
 
-    auto& connman = static_cast<ConnmanTestMsg&>(*g_setup->m_node.connman);
-    connman.ResetAddrCache();
-    connman.ResetMaxOutboundCycle();
-    auto& chainman = static_cast<TestChainstateManager&>(*g_setup->m_node.chainman);
+    auto& node{g_setup->m_node};
+    auto& connman{static_cast<ConnmanTestMsg&>(*node.connman)};
+    connman.Reset();
+    auto& chainman{static_cast<TestChainstateManager&>(*node.chainman)};
     const auto block_index_size{WITH_LOCK(chainman.GetMutex(), return chainman.BlockIndex().size())};
-    SetMockTime(1610000000); // any time to successfully reset ibd
+    const auto initial_sequence{WITH_LOCK(node.mempool->cs, return node.mempool->GetSequence())};
+    FakeNodeClock node_clock{1610000000s}; // 2021-01-07, arbitrary
+    FakeSteadyClock steady_clock;
     chainman.ResetIbd();
     chainman.DisableNextWrite();
 
-    node::Warnings warnings{};
-    NetGroupManager netgroupman{{}};
-    AddrMan addrman{netgroupman, /*deterministic=*/true, /*consistency_check_ratio=*/0};
-    auto peerman = PeerManager::make(connman, addrman,
+    // Reset, so that dangling pointers can be detected by sanitizers.
+    node.banman.reset();
+    node.addrman.reset();
+    node.peerman.reset();
+    node.addrman = std::make_unique<AddrMan>(*node.netgroupman, /*deterministic=*/true, /*consistency_check_ratio=*/0);
+    node.peerman = PeerManager::make(connman, *node.addrman,
                                      /*banman=*/nullptr, chainman,
-                                     *g_setup->m_node.mempool, warnings,
+                                     *node.mempool, *node.warnings,
                                      PeerManager::Options{
                                          .reconcile_txs = true,
                                          .deterministic_rng = true,
                                      });
-    connman.SetMsgProc(peerman.get());
+    connman.SetMsgProc(node.peerman.get());
+    connman.SetAddrman(*node.addrman);
+
+    node.validation_signals->RegisterValidationInterface(node.peerman.get());
 
     LOCK(NetEventsInterface::g_msgproc_mutex);
 
     std::vector<CNode*> peers;
     const auto num_peers_to_add = fuzzed_data_provider.ConsumeIntegralInRange(1, 3);
     for (int i = 0; i < num_peers_to_add; ++i) {
-        peers.push_back(ConsumeNodeAsUniquePtr(fuzzed_data_provider, i).release());
+        peers.push_back(ConsumeNodeAsUniquePtr(fuzzed_data_provider, steady_clock, i).release());
         CNode& p2p_node = *peers.back();
 
         FillNode(fuzzed_data_provider, connman, p2p_node);
@@ -91,12 +101,16 @@ FUZZ_TARGET(process_messages, .init = initialize_process_messages)
         connman.AddTestNode(p2p_node);
     }
 
-    LIMITED_WHILE(fuzzed_data_provider.ConsumeBool(), 30)
-    {
+    // Toggle IBD from within the loop, so that some messages may be processed
+    // under IBD and the rest after leaving it. JumpOutOfIbd() latches, so guard
+    // it to call at most once.
+    bool jump_out_of_ibd{false};
+    LIMITED_WHILE (fuzzed_data_provider.ConsumeBool(), 30) {
+        if (!jump_out_of_ibd) jump_out_of_ibd = fuzzed_data_provider.ConsumeBool();
+        if (jump_out_of_ibd && chainman.IsInitialBlockDownload()) chainman.JumpOutOfIbd();
         const std::string random_message_type{fuzzed_data_provider.ConsumeBytesAsString(CMessageHeader::MESSAGE_TYPE_SIZE).c_str()};
 
-        const auto mock_time = ConsumeTime(fuzzed_data_provider);
-        SetMockTime(mock_time);
+        node_clock.set(ConsumeTime(fuzzed_data_provider));
 
         CSerializedNetMsg net_msg;
         net_msg.m_type = random_message_type;
@@ -115,13 +129,16 @@ FUZZ_TARGET(process_messages, .init = initialize_process_messages)
                 more_work = connman.ProcessMessagesOnce(random_node);
             } catch (const std::ios_base::failure&) {
             }
-            g_setup->m_node.peerman->SendMessages(&random_node);
+            node.peerman->SendMessages(random_node);
         }
     }
-    g_setup->m_node.validation_signals->SyncWithValidationInterfaceQueue();
-    g_setup->m_node.connman->StopNodes();
-    if (block_index_size != WITH_LOCK(chainman.GetMutex(), return chainman.BlockIndex().size())) {
-        // Reuse the global chainman, but reset it when it is dirty
-        ResetChainman(*g_setup);
+    node.validation_signals->SyncWithValidationInterfaceQueue();
+    node.validation_signals->UnregisterValidationInterface(node.peerman.get());
+    node.connman->StopNodes();
+    const auto end_sequence{WITH_LOCK(node.mempool->cs, return node.mempool->GetSequence())};
+    if (block_index_size != WITH_LOCK(chainman.GetMutex(), return chainman.BlockIndex().size()) || initial_sequence != end_sequence) {
+        // Reuse the global chainman and mempool, but reset them when dirty.
+        MakeRandDeterministicDANGEROUS(uint256::ZERO);
+        ResetChainmanAndMempool(*g_setup, node_clock);
     }
 }

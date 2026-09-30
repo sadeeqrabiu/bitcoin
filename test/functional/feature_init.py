@@ -7,6 +7,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import os
 import platform
+import re
 import shutil
 import signal
 import subprocess
@@ -18,6 +19,12 @@ from test_framework.test_node import (
 )
 from test_framework.util import assert_equal
 
+ALL_INDEX_ARGS = [
+    '-txindex=1',
+    '-blockfilterindex=1',
+    '-coinstatsindex=1',
+    '-txospenderindex=1',
+]
 
 class InitTest(BitcoinTestFramework):
     """
@@ -26,17 +33,26 @@ class InitTest(BitcoinTestFramework):
     """
 
     def set_test_params(self):
-        self.setup_clean_chain = False
-        self.num_nodes = 1
+        self.setup_clean_chain = True
+        self.num_nodes = 2
         self.uses_wallet = None
 
-    def init_stress_test(self):
+    def check_clean_start(self, node, extra_args):
+        """Ensure that node restarts successfully after various interrupts."""
+        node.start(extra_args)
+        node.wait_for_rpc_connection()
+        height = node.getblockcount()
+        assert_equal(200, height)
+        self.wait_until(lambda: all(i["synced"] and i["best_block_height"] == height for i in node.getindexinfo().values()))
+
+    def init_stress_test_interrupt(self):
         """
         - test terminating initialization after seeing a certain log line.
-        - test removing certain essential files to test startup error paths.
         """
-        self.stop_node(0)
+        self.start_node(0)
         node = self.nodes[0]
+        self.generate(node, 200, sync_fun=self.no_op)
+        self.stop_node(0)
 
         def sigterm_node():
             if platform.system() == 'Windows':
@@ -46,23 +62,9 @@ class InitTest(BitcoinTestFramework):
                 os.kill(node.process.pid, signal.CTRL_BREAK_EVENT)
             else:
                 node.process.terminate()
-            node.process.wait()
+            assert_equal(0, node.process.wait())
 
-        def start_expecting_error(err_fragment, args):
-            node.assert_start_raises_init_error(
-                extra_args=args,
-                expected_msg=err_fragment,
-                match=ErrorMatch.PARTIAL_REGEX,
-            )
-
-        def check_clean_start(extra_args):
-            """Ensure that node restarts successfully after various interrupts."""
-            node.start(extra_args)
-            node.wait_for_rpc_connection()
-            height = node.getblockcount()
-            assert_equal(200, height)
-            self.wait_until(lambda: all(i["synced"] and i["best_block_height"] == height for i in node.getindexinfo().values()))
-
+        reindex_log_line = b'Reindexing block file blk00000.dat'
         lines_to_terminate_after = [
             b'Validating signatures for all blocks',
             b'scheduler thread start',
@@ -77,35 +79,51 @@ class InitTest(BitcoinTestFramework):
             b'net thread start',
             b'addcon thread start',
             b'initload thread start',
-            b'txindex thread start',
-            b'block filter index thread start',
-            b'coinstatsindex thread start',
+            b'txidx thread start',
+            b'blkfltbscidx thread start',
+            b'coinstatsidx thread start',
+            b'txospenderidx thread start',
             b'msghand thread start',
             b'net thread start',
             b'addcon thread start',
         ]
         if self.is_wallet_compiled():
             lines_to_terminate_after.append(b'Verifying wallet')
+        lines_to_terminate_after.append(reindex_log_line)
 
-        args = ['-txindex=1', '-blockfilterindex=1', '-coinstatsindex=1']
         for terminate_line in lines_to_terminate_after:
             self.log.info(f"Starting node and will terminate after line {terminate_line}")
             with node.busy_wait_for_debug_log([terminate_line]):
+                extra_args = [*ALL_INDEX_ARGS]
+                if terminate_line == reindex_log_line:
+                    extra_args += ['-reindex']
                 if platform.system() == 'Windows':
                     # CREATE_NEW_PROCESS_GROUP is required in order to be able
                     # to terminate the child without terminating the test.
-                    node.start(extra_args=args, creationflags=subprocess.CREATE_NEW_PROCESS_GROUP)
+                    node.start(extra_args=extra_args, creationflags=subprocess.CREATE_NEW_PROCESS_GROUP)
                 else:
-                    node.start(extra_args=args)
+                    node.start(extra_args=extra_args)
             self.log.debug("Terminating node after terminate line was found")
             sigterm_node()
 
         # Prior to deleting/perturbing index files, start node with all indexes enabled.
         # 'check_clean_start' will ensure indexes are synchronized (i.e., data exists to modify)
-        check_clean_start(args)
+        self.check_clean_start(node, ALL_INDEX_ARGS)
         self.stop_node(0)
 
+    def init_stress_test_removals(self):
+        """
+        - test removing certain essential files to test startup error paths.
+        """
         self.log.info("Test startup errors after removing certain essential files")
+        node = self.nodes[0]
+
+        def start_expecting_error(err_fragment, args):
+            node.assert_start_raises_init_error(
+                extra_args=args,
+                expected_msg=err_fragment,
+                match=ErrorMatch.PARTIAL_REGEX,
+            )
 
         deletion_rounds = [
             {
@@ -127,6 +145,11 @@ class InitTest(BitcoinTestFramework):
                 'filepath_glob': 'indexes/txindex/MANIFEST*',
                 'error_message': 'LevelDB error: Corruption: CURRENT points to a non-existent file',
                 'startup_args': ['-txindex=1'],
+            },
+            {
+                'filepath_glob': 'indexes/txospenderindex/db/MANIFEST*',
+                'error_message': 'LevelDB error: Corruption: CURRENT points to a non-existent file',
+                'startup_args': ['-txospenderindex=1'],
             },
             # Removing these files does not result in a startup error:
             # 'indexes/blockfilter/basic/*.dat', 'indexes/blockfilter/basic/db/*.*', 'indexes/coinstatsindex/db/*.*',
@@ -169,6 +192,11 @@ class InitTest(BitcoinTestFramework):
                 'error_message': 'LevelDB error: Corruption',
                 'startup_args': ['-txindex=1'],
             },
+            {
+                'filepath_glob': 'indexes/txospenderindex/db/*',
+                'error_message': 'LevelDB error: Corruption',
+                'startup_args': ['-txospenderindex=1'],
+            },
             # Perturbing these files does not result in a startup error:
             # 'indexes/blockfilter/basic/*.dat', 'indexes/txindex/MANIFEST*', 'indexes/txindex/LOCK'
         ]
@@ -178,6 +206,7 @@ class InitTest(BitcoinTestFramework):
             err_fragment = round_info['error_message']
             startup_args = round_info['startup_args']
             target_files = list(node.chain_path.glob(file_patt))
+            assert target_files, f"Failed to find expected files: {file_patt}"
 
             for target_file in target_files:
                 self.log.info(f"Deleting file to ensure failure {target_file}")
@@ -191,7 +220,7 @@ class InitTest(BitcoinTestFramework):
                 self.log.debug(f"Restoring file from {bak_path} and restarting")
                 Path(bak_path).rename(target_file)
 
-            check_clean_start(args)
+            self.check_clean_start(node, ALL_INDEX_ARGS)
             self.stop_node(0)
 
         self.log.info("Test startup errors after perturbing certain essential files")
@@ -204,6 +233,7 @@ class InitTest(BitcoinTestFramework):
             for dir in dirs:
                 shutil.copytree(node.chain_path / dir, node.chain_path / f"{dir}_bak")
             target_files = list(node.chain_path.glob(file_patt))
+            assert target_files, f"Failed to find expected files: {file_patt}"
 
             for target_file in target_files:
                 self.log.info(f"Perturbing file to ensure failure {target_file}")
@@ -217,7 +247,7 @@ class InitTest(BitcoinTestFramework):
             start_expecting_error(err_fragment, startup_args)
 
             for dir in dirs:
-                shutil.rmtree(node.chain_path / dir)
+                self.cleanup_folder(node.chain_path / dir)
                 shutil.move(node.chain_path / f"{dir}_bak", node.chain_path / dir)
 
     def init_pid_test(self):
@@ -290,10 +320,113 @@ class InitTest(BitcoinTestFramework):
             assert_equal(result["height"], current_height)
             node.wait_until_stopped()
 
+    def init_empty_test(self):
+        self.log.info("Test that stopping and restarting a node that has done nothing is not causing a failure")
+        options = [
+            [],
+            ALL_INDEX_ARGS,
+        ]
+        for option in options:
+            self.restart_node(1, option)
+
+    def restart_node_with_fd_limit(self, limit):
+        """Restart node 1 with a given soft RLIMIT_NOFILE. Skips if the limit cannot be set."""
+        import resource
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        try:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (limit, hard))
+        except (ValueError, OSError):
+            self.log.warning(f"Skipping rlimit test: cannot set soft limit (hard={hard})")
+            return
+        try:
+            self.restart_node(1)
+            self.log.debug(f"Node started successfully with RLIM_INFINITY limit (soft={limit})")
+        finally:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (soft, hard))
+            self.log.debug(f"Restored previous RLIMIT_NOFILE limits (soft={soft}, hard={hard})")
+
+    def init_rlimit_test(self):
+        """Test that bitcoind starts correctly when the soft RLIMIT_NOFILE limit is RLIM_INFINITY."""
+        if self.RLIM_INFINITY is None:
+            self.log.warning("Skipping: resource module not available")
+            return
+
+        self.log.info("Testing node startup with RLIM_INFINITY fd limit")
+        self.restart_node_with_fd_limit(self.RLIM_INFINITY)
+
+    def init_rlimit_large_test(self):
+        """Test that bitcoind starts correctly when the soft RLIMIT_NOFILE limit is above INT_MAX."""
+        if self.RLIM_INFINITY is None:
+            self.log.warning("Skipping: resource module not available")
+            return
+
+        self.log.info("Testing node startup with fd limit above INT_MAX")
+        self.restart_node_with_fd_limit(1 << 31)
+
+    def init_fd_overflow_test(self):
+        node = self.nodes[1]
+        if node.running:
+            self.stop_node(1)
+
+        # A value larger than any possible int saturates to INT_MAX during arg parsing.
+        # Adding in other file descriptor requirements is guaranteed to overflow,
+        # so expect an InitError before RaiseFileDescriptorLimit() is called.
+        self.log.info("Checking -rpcmaxconnections setting that would overflow int is rejected")
+        node.assert_start_raises_init_error(
+            extra_args=[f"-rpcmaxconnections={2**64}"],
+            expected_msg="Error: Too many file descriptors requested.",
+            match=ErrorMatch.PARTIAL_REGEX
+        )
+
+        self.log.info("Checking -rpcmaxconnections is ignored when disabling the HTTP server")
+        with node.assert_debug_log(
+            expected_msgs = ["net thread start"],
+            unexpected_msgs = ["Initialized HTTP server"],
+            timeout = 10
+        ):
+            node.start(extra_args=[f"-rpcmaxconnections={2**64}", "-server=0"])
+        # No HTTP server, no RPC `stop`
+        node.kill_process()
+
+        if self.RLIM_INFINITY is not None:
+            # Get the platform's file descriptor limit, if possible
+            import resource
+            soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+
+            # Lower the hard limit so RaiseFileDescriptorLimit() has a ceiling.
+            # The hard limit can not be raised again without root privilges,
+            # so this test should always be left for last in the process.
+            try:
+                resource.setrlimit(resource.RLIMIT_NOFILE, (soft, soft))
+            except (ValueError, OSError):
+                self.log.warning(f"Skipping rlimit test: cannot reduce hard limit (soft={soft}, hard={hard})")
+                return
+
+            self.log.info("Checking that large -maxconnections setting gets adjusted for available file descriptors")
+            # Note this prints a message to the log and stderr but does not abort the process
+            with node.assert_debug_log(expected_msgs=[f"Reducing -maxconnections from {soft} "]):
+                self.restart_node(1, extra_args=[f"-maxconnections={soft}"])
+            self.stop_node(1, expected_stderr=re.compile(f"Reducing -maxconnections from {soft} "))
+
+            # From httpserver.h
+            DEFAULT_MAX_HTTP_CONNECTIONS = 16
+
+            self.log.info("Checking -rpcmaxconnections gets blamed if available file descriptors are insufficient")
+            node.assert_start_raises_init_error(
+                extra_args=[f"-rpcmaxconnections={DEFAULT_MAX_HTTP_CONNECTIONS + 1}", f"-maxconnections={soft}"],
+                expected_msg="Not enough file descriptors available. Try reducing -rpcmaxconnections",
+                match=ErrorMatch.PARTIAL_REGEX
+            )
+
     def run_test(self):
         self.init_pid_test()
-        self.init_stress_test()
+        self.init_stress_test_interrupt()
+        self.init_stress_test_removals()
         self.break_wait_test()
+        self.init_empty_test()
+        self.init_rlimit_test()
+        self.init_rlimit_large_test()
+        self.init_fd_overflow_test()
 
 
 if __name__ == '__main__':

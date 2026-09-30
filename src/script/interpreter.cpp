@@ -8,10 +8,20 @@
 #include <crypto/ripemd160.h>
 #include <crypto/sha1.h>
 #include <crypto/sha256.h>
+#include <prevector.h>
 #include <pubkey.h>
 #include <script/script.h>
+#include <serialize.h>
+#include <span.h>
 #include <tinyformat.h>
 #include <uint256.h>
+
+#include <algorithm>
+#include <cassert>
+#include <compare>
+#include <cstring>
+#include <limits>
+#include <stdexcept>
 
 typedef std::vector<unsigned char> valtype;
 
@@ -608,7 +618,7 @@ bool EvalScript(std::vector<std::vector<unsigned char> >& stack, const CScript& 
                     if (fExec)
                     {
                         if (stack.size() < 1)
-                            return set_error(serror, SCRIPT_ERR_UNBALANCED_CONDITIONAL);
+                            return set_error(serror, SCRIPT_ERR_INVALID_STACK_OPERATION);
                         valtype& vch = stacktop(-1);
                         // Tapscript requires minimal IF/NOTIF inputs as a consensus rule.
                         if (sigversion == SigVersion::TAPSCRIPT) {
@@ -1223,6 +1233,10 @@ bool EvalScript(std::vector<std::vector<unsigned char> >& stack, const CScript& 
                 return set_error(serror, SCRIPT_ERR_STACK_SIZE);
         }
     }
+    catch (const scriptnum_error&)
+    {
+        return set_error(serror, SCRIPT_ERR_SCRIPTNUM);
+    }
     catch (...)
     {
         return set_error(serror, SCRIPT_ERR_UNKNOWN_ERROR);
@@ -1254,12 +1268,8 @@ private:
     const CScript& scriptCode; //!< output script being consumed
     const unsigned int nIn;    //!< input index of txTo being signed
     const bool fAnyoneCanPay;  //!< whether the hashtype has the SIGHASH_ANYONECANPAY flag set
-    // Temporary workaround for a clang-tidy bug fixed in version 22.
-    // See: https://github.com/llvm/llvm-project/issues/160394.
-    // NOLINTBEGIN(modernize-use-default-member-init)
     const bool fHashSingle;    //!< whether the hashtype is SIGHASH_SINGLE
     const bool fHashNone;      //!< whether the hashtype is SIGHASH_NONE
-    // NOLINTEND(modernize-use-default-member-init)
 
 public:
     CTransactionSignatureSerializer(const T& txToIn, const CScript& scriptCodeIn, unsigned int nInIn, int nHashTypeIn) :

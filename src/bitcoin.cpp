@@ -6,6 +6,7 @@
 
 #include <clientversion.h>
 #include <common/args.h>
+#include <common/license_info.h>
 #include <common/system.h>
 #include <util/fs.h>
 #include <util/exec.h>
@@ -168,7 +169,7 @@ bool UseMultiprocess(const CommandLine& cmd)
 
     // If any -ipc* options are set these need to be processed by a
     // multiprocess-capable binary.
-    return args.IsArgSet("-ipcbind") || args.IsArgSet("-ipcconnect") || args.IsArgSet("-ipcfd");
+    return args.IsArgSet("-ipcbind") || args.IsArgSet("-ipcconnect") || args.IsArgSet("-ipcchild");
 }
 
 //! Execute the specified bitcoind, bitcoin-qt or other command line in `args`

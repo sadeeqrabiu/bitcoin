@@ -8,9 +8,10 @@
 #include <random.h>
 #include <span.h>
 #include <uint256.h>
+#include <util/check.h>
 
 #include <algorithm>
-#include <cassert>
+#include <span>
 
 static void EllSwiftCreate(benchmark::Bench& bench)
 {
@@ -29,4 +30,4 @@ static void EllSwiftCreate(benchmark::Bench& bench)
     });
 }
 
-BENCHMARK(EllSwiftCreate, benchmark::PriorityLevel::HIGH);
+BENCHMARK(EllSwiftCreate);

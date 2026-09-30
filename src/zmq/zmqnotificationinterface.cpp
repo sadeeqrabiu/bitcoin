@@ -7,18 +7,17 @@
 #include <common/args.h>
 #include <kernel/mempool_entry.h>
 #include <kernel/types.h>
-#include <logging.h>
 #include <netbase.h>
 #include <primitives/block.h>
 #include <primitives/transaction.h>
-#include <validationinterface.h>
+#include <util/check.h>
+#include <util/log.h>
 #include <zmq/zmqabstractnotifier.h>
 #include <zmq/zmqpublishnotifier.h>
 #include <zmq/zmqutil.h>
 
 #include <zmq.h>
 
-#include <cassert>
 #include <map>
 #include <string>
 #include <utility>

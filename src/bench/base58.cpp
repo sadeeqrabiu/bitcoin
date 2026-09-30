@@ -4,7 +4,6 @@
 
 #include <base58.h>
 #include <bench/bench.h>
-#include <span.h>
 
 #include <array>
 #include <cstring>
@@ -51,6 +50,6 @@ static void Base58Decode(benchmark::Bench& bench)
 }
 
 
-BENCHMARK(Base58Encode, benchmark::PriorityLevel::HIGH);
-BENCHMARK(Base58CheckEncode, benchmark::PriorityLevel::HIGH);
-BENCHMARK(Base58Decode, benchmark::PriorityLevel::HIGH);
+BENCHMARK(Base58Encode);
+BENCHMARK(Base58CheckEncode);
+BENCHMARK(Base58Decode);

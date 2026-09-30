@@ -97,6 +97,7 @@ ForEachMacros:
   - BOOST_FOREACH
 IfMacros:
   - KJ_IF_MAYBE
+  - LIMITED_WHILE
 IncludeBlocks:   Regroup
 IncludeCategories:
   - Regex:           '^<bitcoin-build-config\.h>'
@@ -106,6 +107,9 @@ IncludeCategories:
     Priority:        2
     CaseSensitive:   true
   - Regex:           '^<Q'
+    Priority:        2
+    CaseSensitive:   true
+  - Regex:           '^<zmq.h>$'
     Priority:        2
     CaseSensitive:   true
   - Regex:           '^<[^>.]*>'
@@ -142,6 +146,7 @@ LambdaBodyIndentation: Signature
 LineEnding:      DeriveLF
 MacroBlockBegin: ''
 MacroBlockEnd:   ''
+MainIncludeChar: AngleBracket
 MaxEmptyLinesToKeep: 2
 NamespaceIndentation: None
 ObjCBinPackProtocolList: Auto

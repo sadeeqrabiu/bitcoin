@@ -7,12 +7,13 @@
 
 #include <consensus/amount.h>
 #include <policy/feerate.h>
+#include <primitives/transaction_identifier.h>
 #include <random.h>
 #include <sync.h>
-#include <threadsafety.h>
 #include <uint256.h>
+#include <util/expected.h>
+#include <util/fees.h>
 #include <util/fs.h>
-#include <validationinterface.h>
 
 #include <array>
 #include <chrono>
@@ -23,17 +24,14 @@
 #include <vector>
 
 
-// How often to flush fee estimates to fee_estimates.dat.
-static constexpr std::chrono::hours FEE_FLUSH_INTERVAL{1};
-
-/** fee_estimates.dat that are more than 60 hours (2.5 days) old will not be read,
+/** Block policy estimate files that are more than 60 hours (2.5 days) old will not be read,
  * as fee estimates are based on historical data and may be inaccurate if
  * network activity has changed.
  */
-static constexpr std::chrono::hours MAX_FILE_AGE{60};
+inline constexpr std::chrono::hours MAX_FILE_AGE{60};
 
 // Whether we allow importing a fee_estimates file older than MAX_FILE_AGE.
-static constexpr bool DEFAULT_ACCEPT_STALE_FEE_ESTIMATES{false};
+inline constexpr bool DEFAULT_ACCEPT_STALE_FEE_ESTIMATES{false};
 
 class AutoFile;
 class TxConfirmStats;
@@ -48,7 +46,7 @@ enum class FeeEstimateHorizon {
     LONG_HALFLIFE,
 };
 
-static constexpr auto ALL_FEE_ESTIMATE_HORIZONS = std::array{
+inline constexpr auto ALL_FEE_ESTIMATE_HORIZONS = std::array{
     FeeEstimateHorizon::SHORT_HALFLIFE,
     FeeEstimateHorizon::MED_HALFLIFE,
     FeeEstimateHorizon::LONG_HALFLIFE,
@@ -57,17 +55,15 @@ static constexpr auto ALL_FEE_ESTIMATE_HORIZONS = std::array{
 std::string StringForFeeEstimateHorizon(FeeEstimateHorizon horizon);
 
 /* Enumeration of reason for returned fee estimate */
-enum class FeeReason {
+enum class BlockPolicyEstimateReason {
     NONE,
     HALF_ESTIMATE,
     FULL_ESTIMATE,
     DOUBLE_ESTIMATE,
     CONSERVATIVE,
-    MEMPOOL_MIN,
-    PAYTXFEE,
-    FALLBACK,
-    REQUIRED,
 };
+
+std::string StringForBlockPolicyEstimateReason(BlockPolicyEstimateReason reason);
 
 /* Used to return detailed information about a feerate bucket */
 struct EstimatorBucket
@@ -92,7 +88,7 @@ struct EstimationResult
 struct FeeCalculation
 {
     EstimationResult est;
-    FeeReason reason = FeeReason::NONE;
+    BlockPolicyEstimateReason reason = BlockPolicyEstimateReason::NONE;
     int desiredTarget = 0;
     int returnedTarget = 0;
     unsigned int best_height{0};
@@ -146,7 +142,7 @@ struct FeeCalculation
  * a certain number of blocks.  Every time a block is added to the best chain, this class records
  * stats on the transactions included in that block
  */
-class CBlockPolicyEstimator : public CValidationInterface
+class CBlockPolicyEstimator
 {
 private:
     /** Track confirm delays up to 12 blocks for short horizon */
@@ -159,7 +155,7 @@ private:
     static constexpr unsigned int LONG_BLOCK_PERIODS = 42;
     static constexpr unsigned int LONG_SCALE = 24;
     /** Historical estimates that are older than this aren't valid */
-    static const unsigned int OLDEST_ESTIMATE_HISTORY = 6 * 1008;
+    static constexpr unsigned int OLDEST_ESTIMATE_HISTORY{6 * 1008};
 
     /** Decay of .962 is a half-life of 18 blocks or about 3 hours */
     static constexpr double SHORT_DECAY = .962;
@@ -181,13 +177,15 @@ private:
     static constexpr double SUFFICIENT_TXS_SHORT = 0.5;
 
     /** Minimum and Maximum values for tracking feerates
-     * The MIN_BUCKET_FEERATE should just be set to the lowest reasonable feerate we
-     * might ever want to track.  Historically this has been 1000 since it was
-     * inheriting DEFAULT_MIN_RELAY_TX_FEE and changing it is disruptive as it
-     * invalidates old estimates files. So leave it at 1000 unless it becomes
-     * necessary to lower it, and then lower it substantially.
+     * The MIN_BUCKET_FEERATE should just be set to the lowest reasonable feerate.
+     * MIN_BUCKET_FEERATE has historically inherited DEFAULT_MIN_RELAY_TX_FEE.
+     * It is hardcoded because changing it is disruptive, as it invalidates existing fee
+     * estimate files.
+     *
+     * Whenever DEFAULT_MIN_RELAY_TX_FEE changes, this value should be updated
+     * accordingly. At the same time CURRENT_FEES_FILE_VERSION should be bumped.
      */
-    static constexpr double MIN_BUCKET_FEERATE = 1000;
+    static constexpr double MIN_BUCKET_FEERATE = 100;
     static constexpr double MAX_BUCKET_FEERATE = 1e7;
 
     /** Spacing of FeeRate buckets
@@ -200,7 +198,7 @@ private:
     const fs::path m_estimation_filepath;
 public:
     /** Create new BlockPolicyEstimator and initialize stats tracking classes with default values */
-    CBlockPolicyEstimator(const fs::path& estimation_filepath, const bool read_stale_estimates);
+    CBlockPolicyEstimator(const fs::path& estimation_filepath, bool read_stale_estimates);
     virtual ~CBlockPolicyEstimator();
 
     /** Process all the transactions that have been included in a block */
@@ -263,14 +261,14 @@ public:
     /** Calculates the age of the file, since last modified */
     std::chrono::hours GetFeeEstimatorFileAge();
 
-protected:
-    /** Overridden from CValidationInterface. */
-    void TransactionAddedToMempool(const NewMempoolTransactionInfo& tx, uint64_t /*unused*/) override
+    /** Return the highest confirmation target for which an estimate can be provided. */
+    unsigned int MaximumTarget() const
         EXCLUSIVE_LOCKS_REQUIRED(!m_cs_fee_estimator);
-    void TransactionRemovedFromMempool(const CTransactionRef& tx, MemPoolRemovalReason /*unused*/, uint64_t /*unused*/) override
+
+    /** Estimate the feerate needed to confirm within @p target blocks; wraps estimateSmartFee into a FeeRateEstimation. */
+    util::Expected<FeeRateEstimation, FeeRateEstimationError> EstimateFeeRate(int target, bool conservative) const
         EXCLUSIVE_LOCKS_REQUIRED(!m_cs_fee_estimator);
-    void MempoolTransactionsRemovedForBlock(const std::vector<RemovedMempoolTransactionInfo>& txs_removed_for_block, unsigned int nBlockHeight) override
-        EXCLUSIVE_LOCKS_REQUIRED(!m_cs_fee_estimator);
+
 
 private:
     mutable Mutex m_cs_fee_estimator;

@@ -17,9 +17,7 @@
 #include <utility>
 #include <vector>
 
-namespace {
-
-using namespace cluster_linearize;
+namespace cluster_linearize {
 
 using TestBitSet = BitSet<32>;
 
@@ -99,7 +97,7 @@ using TestBitSet = BitSet<32>;
 struct DepGraphFormatter
 {
     /** Convert x>=0 to 2x (even), x<0 to -2x-1 (odd). */
-    [[maybe_unused]] static uint64_t SignedToUnsigned(int64_t x) noexcept
+    static uint64_t SignedToUnsigned(int64_t x) noexcept
     {
         if (x < 0) {
             return 2 * uint64_t(-(x + 1)) + 1;
@@ -109,7 +107,7 @@ struct DepGraphFormatter
     }
 
     /** Convert even x to x/2 (>=0), odd x to -(x/2)-1 (<0). */
-    [[maybe_unused]] static int64_t UnsignedToSigned(uint64_t x) noexcept
+    static int64_t UnsignedToSigned(uint64_t x) noexcept
     {
         if (x & 1) {
             return -int64_t(x / 2) - 1;
@@ -394,28 +392,28 @@ void SanityCheck(const DepGraph<SetType>& depgraph, std::span<const DepGraphInde
     }
 }
 
-inline uint64_t MaxOptimalLinearizationIters(DepGraphIndex cluster_count)
+inline uint64_t MaxOptimalLinearizationCost(DepGraphIndex cluster_count)
 {
     // These are the largest numbers seen returned as cost by Linearize(), in a large randomized
     // trial. There exist almost certainly far worse cases, but they are unlikely to be
     // encountered in randomized tests. The purpose of these numbers is guaranteeing that for
     // *some* reasonable cost bound, optimal linearizations are always found.
-    static constexpr uint64_t ITERS[65] = {
+    static constexpr uint64_t COSTS[65] = {
         0,
-        0, 2, 8, 21, 51, 96, 162, 200,
-        273, 323, 413, 506, 602, 788, 883, 948,
-        1153, 1187, 1367, 1619, 1854, 2271, 2257, 2707,
-        2904, 3275, 3342, 4209, 4648, 4146, 4273, 4905,
-        5358, 5767, 5977, 6777, 7812, 7689, 8478, 8425,
-        9561, 11765, 10743, 11806, 12812, 12838, 15421, 16778,
-        16661, 19393, 17995, 23947, 23314, 24564, 26209, 29267,
-        24719, 31065, 31794, 29185, 32465, 35432, 39986, 36865
+        0, 545, 928, 1633, 2647, 4065, 5598, 8258,
+        9505, 11471, 14137, 19553, 20460, 26191, 28397, 32599,
+        41631, 47419, 56329, 57767, 72196, 63652, 95366, 96537,
+        115653, 125407, 131734, 145090, 156349, 164665, 194224, 203953,
+        207710, 225878, 239971, 252284, 256534, 222142, 251332, 357098,
+        325788, 295867, 410053, 497483, 533892, 576572, 577845, 572400,
+        592536, 455082, 609249, 659130, 714091, 544507, 718788, 562378,
+        601926, 1025081, 732725, 708896, 738224, 900445, 1092519, 1139946
     };
-    assert(cluster_count < std::size(ITERS));
+    assert(cluster_count < std::size(COSTS));
     // Multiply the table number by two, to account for the fact that they are not absolutes.
-    return ITERS[cluster_count] * 2;
+    return COSTS[cluster_count] * 2;
 }
 
-} // namespace
+} // namespace cluster_linearize
 
 #endif // BITCOIN_TEST_UTIL_CLUSTER_LINEARIZE_H

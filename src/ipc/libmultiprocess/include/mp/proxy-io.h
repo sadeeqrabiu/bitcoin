@@ -13,7 +13,9 @@
 #include <capnp/rpc-twoparty.h>
 
 #include <assert.h>
+#include <algorithm>
 #include <condition_variable>
+#include <cstdlib>
 #include <functional>
 #include <kj/function.h>
 #include <map>
@@ -25,6 +27,7 @@
 
 namespace mp {
 struct ThreadContext;
+struct Listener;
 
 struct InvokeContext
 {
@@ -48,6 +51,19 @@ struct ServerInvokeContext : InvokeContext
     ProxyServer& proxy_server;
     CallContext& call_context;
     int req;
+    //! For IPC methods that execute asynchronously, not on the event-loop
+    //! thread: lock preventing the event-loop thread from freeing the params or
+    //! results structs if the request is canceled while the worker thread is
+    //! reading params (`call_context.getParams()`) or writing results
+    //! (`call_context.getResults()`).
+    Lock* cancel_lock{nullptr};
+    //! For IPC methods that execute asynchronously, not on the event-loop
+    //! thread, this is set to true if the IPC call was canceled by the client
+    //! or canceled by a disconnection. If the call runs on the event-loop
+    //! thread, it can't be canceled. This should be accessed with cancel_lock
+    //! held if it is not null, since in the asynchronous case it is accessed
+    //! from multiple threads.
+    bool request_canceled{false};
 
     ServerInvokeContext(ProxyServer& proxy_server, CallContext& call_context, int req)
         : InvokeContext{*proxy_server.m_context.connection}, proxy_server{proxy_server}, call_context{call_context}, req{req}
@@ -82,11 +98,23 @@ template <>
 struct ProxyServer<Thread> final : public Thread::Server
 {
 public:
-    ProxyServer(ThreadContext& thread_context, std::thread&& thread);
+    ProxyServer(Connection& connection, ThreadContext& thread_context, std::thread&& thread);
     ~ProxyServer();
     kj::Promise<void> getName(GetNameContext context) override;
+
+    //! Run a callback function fn returning T on this thread. The function will
+    //! be queued and executed as soon as the thread is idle, and when fn
+    //! returns, the promise returned by this method will be fulfilled with the
+    //! value fn returned.
+    template<typename T, typename Fn>
+    kj::Promise<T> post(Fn&& fn);
+
+    EventLoopRef m_loop;
     ThreadContext& m_thread_context;
     std::thread m_thread;
+    //! Promise signaled when m_thread_context.waiter is ready and there is no
+    //! post() callback function waiting to execute.
+    kj::Promise<void> m_thread_ready{kj::READY_NOW};
 };
 
 //! Handler for kj::TaskSet failed task events.
@@ -230,7 +258,7 @@ public:
 
     //! Run event loop. Does not return until shutdown. This should only be
     //! called once from the m_thread_id thread. This will block until
-    //! the m_num_clients reference count is 0.
+    //! the m_num_refs reference count is 0.
     void loop();
 
     //! Run function on event loop thread. Does not return until function completes.
@@ -289,9 +317,13 @@ public:
     //! Pipe write handle used to wake up the event loop thread.
     int m_post_fd = -1;
 
-    //! Number of clients holding references to ProxyServerBase objects that
-    //! reference this event loop.
-    int m_num_clients MP_GUARDED_BY(m_mutex) = 0;
+    //! Number of EventLoopRef instances referencing this event loop. This is a
+    //! sum of the number of client and server objects (Connection, ProxyClient,
+    //! ProxyServer) using the loop, plus temporary references held while
+    //! posting functions to the loop, plus any references held by external code
+    //! to keep the loop running. The loop() method exits when this count drops
+    //! to 0 (and m_async_fns is empty).
+    int m_num_refs MP_GUARDED_BY(m_mutex) = 0;
 
     //! Mutex and condition variable used to post tasks to event loop and async
     //! thread.
@@ -315,14 +347,41 @@ public:
 
     //! External context pointer.
     void* m_context;
+
+    //! Hook called when ProxyServer<ThreadMap>::makeThread() is called.
+    std::function<void()> testing_hook_makethread;
+
+    //! Hook called on the worker thread inside makeThread(), after the thread
+    //! context is set up and thread_context promise is fulfilled, but before it
+    //! starts waiting for requests.
+    std::function<void()> testing_hook_makethread_created;
+
+    //! Hook called on the worker thread when it starts to execute an async
+    //! request. Used by tests to control timing or inject behavior at this
+    //! point in execution.
+    std::function<void()> testing_hook_async_request_start;
+
+    //! Hook called on the worker thread just before returning results.
+    std::function<void()> testing_hook_async_request_done;
+
+    //! Hook called on the event loop thread when a client has connected.
+    std::function<void()> testing_hook_connected;
+
+    //! Hook called on the event loop thread when a client has disconnected.
+    std::function<void()> testing_hook_disconnected;
 };
 
-//! Single element task queue used to handle recursive capnp calls. (If server
-//! makes an callback into the client in the middle of a request, while client
+//! Single element task queue used to handle recursive capnp calls. (If the
+//! server makes a callback into the client in the middle of a request, while the client
 //! thread is blocked waiting for server response, this is what allows the
-//! client to run the request in the same thread, the same way code would run in
-//! single process, with the callback sharing same thread stack as the original
-//! call.
+//! client to run the request in the same thread, the same way code would run in a
+//! single process, with the callback sharing the same thread stack as the original
+//! call.) To support this, the clientInvoke function calls Waiter::wait() to
+//! block the client IPC thread while initial request is in progress. Then if
+//! there is a callback, it is executed with Waiter::post().
+//!
+//! The Waiter class is also used server-side by `ProxyServer<Thread>::post()`
+//! to execute IPC calls on worker threads.
 struct Waiter
 {
     Waiter() = default;
@@ -338,7 +397,7 @@ struct Waiter
     }
 
     template <class Predicate>
-    void wait(Lock& lock, Predicate pred)
+    void wait(Lock& lock, Predicate pred) MP_REQUIRES(m_mutex)
     {
         m_cv.wait(lock.m_lock, [&]() MP_REQUIRES(m_mutex) {
             // Important for this to be "while (m_fn)", not "if (m_fn)" to avoid
@@ -364,7 +423,7 @@ struct Waiter
     //! EventLoop::m_mutex as long as Waiter::mutex is locked first and
     //! EventLoop::m_mutex is locked second.
     Mutex m_mutex;
-    std::condition_variable m_cv;
+    std::condition_variable m_cv MP_GUARDED_BY(m_mutex);
     std::optional<kj::Function<void()>> m_fn MP_GUARDED_BY(m_mutex);
 };
 
@@ -404,11 +463,11 @@ public:
     template <typename F>
     void onDisconnect(F&& f)
     {
-        // Add disconnect handler to local TaskSet to ensure it is cancelled and
+        // Add disconnect handler to local TaskSet to ensure it is canceled and
         // will never run after connection object is destroyed. But when disconnect
         // handler fires, do not call the function f right away, instead add it
         // to the EventLoop TaskSet to avoid "Promise callback destroyed itself"
-        // error in cases where f deletes this Connection object.
+        // error in the typical case where f deletes this Connection object.
         m_on_disconnect.add(m_network.onDisconnect().then(
             [f = std::forward<F>(f), this]() mutable { m_loop->m_task_set->add(kj::evalLater(kj::mv(f))); }));
     }
@@ -416,6 +475,9 @@ public:
     EventLoopRef m_loop;
     kj::Own<kj::AsyncIoStream> m_stream;
     LoggingErrorHandler m_error_handler{*m_loop};
+    //! TaskSet used to cancel the m_network.onDisconnect() handler for remote
+    //! disconnections, if the connection is closed locally first by deleting
+    //! this Connection object.
     kj::TaskSet m_on_disconnect{m_error_handler};
     ::capnp::TwoPartyVatNetwork m_network;
     std::optional<::capnp::RpcSystem<::capnp::rpc::twoparty::VatId>> m_rpc_system;
@@ -427,6 +489,18 @@ public:
     //! Collection of server-side IPC worker threads (ProxyServer<Thread> objects previously returned by
     //! ThreadMap.makeThread) used to service requests to clients.
     ::capnp::CapabilityServerSet<Thread> m_threads;
+
+    //! A thread created by makePool with associated pending work queue. Vector is filled once by makePool() and never resized.
+    struct PoolSlot {
+        Thread::Client client;
+        size_t depth{0};
+    };
+    std::vector<PoolSlot> m_thread_pool;
+
+    //! Canceler for canceling promises that we want to discard when the
+    //! connection is destroyed. This is used to interrupt method calls that are
+    //! still executing at time of disconnection.
+    kj::Canceler m_canceler;
 
     //! Cleanup functions to run if connection is broken unexpectedly.  List
     //! will be empty if all ProxyClient are destroyed cleanly before the
@@ -457,6 +531,7 @@ ProxyClientBase<Interface, Impl>::ProxyClientBase(typename Interface::Client cli
     : m_client(std::move(client)), m_context(connection)
 
 {
+    MP_LOG(*m_context.loop, Log::Debug) << "Creating " << CxxTypeName(*this) << " " << this;
     // Handler for the connection getting destroyed before this client object.
     auto disconnect_cb = m_context.connection->addSyncCleanup([this]() {
         // Release client capability by move-assigning to temporary.
@@ -484,7 +559,12 @@ ProxyClientBase<Interface, Impl>::ProxyClientBase(typename Interface::Client cli
         // the remote object, waiting for it to be deleted server side. If the
         // capnp interface does not define a destroy method, this will just call
         // an empty stub defined in the ProxyClientBase class and do nothing.
-        Sub::destroy(*this);
+        // Exceptions are caught and logged rather than propagated because
+        // ~ProxyClientBase is noexcept and the peer may be gone by the time
+        // this runs.
+        if (kj::runCatchingExceptions([&]{ Sub::destroy(*this); }) != nullptr) {
+            MP_LOG(*m_context.loop, Log::Warning) << "Remote destroy call failed during cleanup. Continuing.";
+        }
 
         // FIXME: Could just invoke removed addCleanup fn here instead of duplicating code
         m_context.loop->sync([&]() {
@@ -513,13 +593,16 @@ ProxyClientBase<Interface, Impl>::ProxyClientBase(typename Interface::Client cli
 template <typename Interface, typename Impl>
 ProxyClientBase<Interface, Impl>::~ProxyClientBase() noexcept
 {
+    MP_LOG(*m_context.loop, Log::Debug) << "Cleaning up " << CxxTypeName(*this) << " " << this;
     CleanupRun(m_context.cleanup_fns);
+    MP_LOG(*m_context.loop, Log::Debug) << "Destroying " << CxxTypeName(*this) << " " << this;
 }
 
 template <typename Interface, typename Impl>
 ProxyServerBase<Interface, Impl>::ProxyServerBase(std::shared_ptr<Impl> impl, Connection& connection)
     : m_impl(std::move(impl)), m_context(&connection)
 {
+    MP_LOG(*m_context.loop, Log::Debug) << "Creating " << CxxTypeName(*this) << " " << this;
     assert(m_impl);
 }
 
@@ -538,6 +621,7 @@ ProxyServerBase<Interface, Impl>::ProxyServerBase(std::shared_ptr<Impl> impl, Co
 template <typename Interface, typename Impl>
 ProxyServerBase<Interface, Impl>::~ProxyServerBase()
 {
+    MP_LOG(*m_context.loop, Log::Debug) << "Cleaning up " << CxxTypeName(*this) << " " << this;
     if (m_impl) {
         // If impl is non-null at this point, it means no client is waiting for
         // the m_impl server object to be destroyed synchronously. This can
@@ -564,6 +648,7 @@ ProxyServerBase<Interface, Impl>::~ProxyServerBase()
         });
     }
     assert(m_context.cleanup_fns.empty());
+    MP_LOG(*m_context.loop, Log::Debug) << "Destroying " << CxxTypeName(*this) << " " << this;
 }
 
 //! If the capnp interface defined a special "destroy" method, as described the
@@ -675,6 +760,70 @@ struct ThreadContext
     bool loop_thread = false;
 };
 
+template<typename T, typename Fn>
+kj::Promise<T> ProxyServer<Thread>::post(Fn&& fn)
+{
+    auto ready = kj::newPromiseAndFulfiller<void>(); // Signaled when waiter is ready to post again.
+    auto cancel_monitor_ptr = kj::heap<CancelMonitor>();
+    CancelMonitor& cancel_monitor = *cancel_monitor_ptr;
+    // Keep a reference to the ProxyServer<Thread> instance by assigning it to
+    // the self variable. ProxyServer instances are reference-counted and if the
+    // client drops its reference, this variable keeps the instance alive until
+    // the thread finishes executing. The self variable needs to be destroyed on
+    // the event loop thread so it is freed in a sync() call below.
+    auto self = thisCap();
+    auto ret = m_thread_ready.then([this, self = std::move(self), fn = std::forward<Fn>(fn), ready_fulfiller = kj::mv(ready.fulfiller), cancel_monitor_ptr = kj::mv(cancel_monitor_ptr)]() mutable {
+        auto result = kj::newPromiseAndFulfiller<T>(); // Signaled when fn() is called, with its return value.
+        bool posted = m_thread_context.waiter->post([this, self = std::move(self), fn = std::forward<Fn>(fn), ready_fulfiller = kj::mv(ready_fulfiller), result_fulfiller = kj::mv(result.fulfiller), cancel_monitor_ptr = kj::mv(cancel_monitor_ptr)]() mutable {
+            // Fulfill ready.promise now, as soon as the Waiter starts executing
+            // this lambda, so the next ProxyServer<Thread>::post() call can
+            // immediately call waiter->post(). It is important to do this
+            // before calling fn() because fn() can make an IPC call back to the
+            // client, which can make another IPC call to this server thread.
+            // (This typically happens when IPC methods take std::function
+            // parameters.) When this happens the second call to the server
+            // thread should not be blocked waiting for the first call.
+            m_loop->sync([ready_fulfiller = kj::mv(ready_fulfiller)]() mutable {
+                ready_fulfiller->fulfill();
+                ready_fulfiller = nullptr;
+            });
+            std::optional<T> result_value;
+            kj::Maybe<kj::Exception> exception{kj::runCatchingExceptions([&]{ result_value.emplace(fn(*cancel_monitor_ptr)); })};
+            m_loop->sync([this, &result_value, &exception, self = kj::mv(self), result_fulfiller = kj::mv(result_fulfiller), cancel_monitor_ptr = kj::mv(cancel_monitor_ptr)]() mutable {
+                // Destroy CancelMonitor here before fulfilling or rejecting the
+                // promise so it doesn't get triggered when the promise is
+                // destroyed.
+                cancel_monitor_ptr = nullptr;
+                // Send results to the fulfiller. Technically it would be ok to
+                // skip this if promise was canceled, but it's simpler to just
+                // do it unconditionally.
+                KJ_IF_MAYBE(e, exception) {
+                    assert(!result_value);
+                    result_fulfiller->reject(kj::mv(*e));
+                } else {
+                    assert(result_value);
+                    result_fulfiller->fulfill(kj::mv(*result_value));
+                    result_value.reset();
+                }
+                result_fulfiller = nullptr;
+                // Use evalLater to destroy the ProxyServer<Thread> self
+                // reference, if it is the last reference, because the
+                // ProxyServer<Thread> destructor needs to join the thread,
+                // which can't happen until this sync() block has exited.
+                m_loop->m_task_set->add(kj::evalLater([self = kj::mv(self)] {}));
+            });
+        });
+        // Assert that calling Waiter::post did not fail. It could only return
+        // false if a new function was posted before the previous one finished
+        // executing, but new functions are only posted when m_thread_ready is
+        // signaled, so this should never happen.
+        assert(posted);
+        return kj::mv(result.promise);
+    }).attach(kj::heap<CancelProbe>(cancel_monitor));
+    m_thread_ready = kj::mv(ready.promise);
+    return ret;
+}
+
 //! Given stream file descriptor, make a new ProxyClient object to send requests
 //! over the stream. Also create a new Connection object embedded in the
 //! client that is freed when the client is closed.
@@ -702,8 +851,8 @@ std::unique_ptr<ProxyClient<InitInterface>> ConnectStream(EventLoop& loop, int f
 //! handles requests from the stream by calling the init object. Embed the
 //! ProxyServer in a Connection object that is stored and erased if
 //! disconnected. This should be called from the event loop thread.
-template <typename InitInterface, typename InitImpl>
-void _Serve(EventLoop& loop, kj::Own<kj::AsyncIoStream>&& stream, InitImpl& init)
+template <typename InitInterface, typename InitImpl, typename OnDisconnect>
+void _Serve(EventLoop& loop, kj::Own<kj::AsyncIoStream>&& stream, InitImpl& init, OnDisconnect&& on_disconnect)
 {
     loop.m_incoming_connections.emplace_front(loop, kj::mv(stream), [&](Connection& connection) {
         // Disable deleter so proxy server object doesn't attempt to delete the
@@ -712,23 +861,47 @@ void _Serve(EventLoop& loop, kj::Own<kj::AsyncIoStream>&& stream, InitImpl& init
         return kj::heap<ProxyServer<InitInterface>>(std::shared_ptr<InitImpl>(&init, [](InitImpl*){}), connection);
     });
     auto it = loop.m_incoming_connections.begin();
-    it->onDisconnect([&loop, it] {
+    MP_LOG(loop, Log::Info) << "IPC server: socket connected.";
+    if (loop.testing_hook_connected) loop.testing_hook_connected();
+    it->onDisconnect([&loop, it, on_disconnect = std::forward<OnDisconnect>(on_disconnect)]() mutable {
         MP_LOG(loop, Log::Info) << "IPC server: socket disconnected.";
         loop.m_incoming_connections.erase(it);
+        on_disconnect();
+        if (loop.testing_hook_disconnected) loop.testing_hook_disconnected();
     });
 }
 
-//! Given connection receiver and an init object, handle incoming connections by
-//! calling _Serve, to create ProxyServer objects and forward requests to the
-//! init object.
-template <typename InitInterface, typename InitImpl>
-void _Listen(EventLoop& loop, kj::Own<kj::ConnectionReceiver>&& listener, InitImpl& init)
+struct Listener
 {
-    auto* ptr = listener.get();
-    loop.m_task_set->add(ptr->accept().then(
-        [&loop, &init, listener = kj::mv(listener)](kj::Own<kj::AsyncIoStream>&& stream) mutable {
-            _Serve<InitInterface>(loop, kj::mv(stream), init);
-            _Listen<InitInterface>(loop, kj::mv(listener), init);
+    explicit Listener(kj::Own<kj::ConnectionReceiver>&& receiver, std::optional<size_t> max_connections)
+        : m_receiver(kj::mv(receiver)), m_max_connections(max_connections) {}
+
+    bool atCapacity() const
+    {
+        return m_max_connections && m_active_connections >= *m_max_connections;
+    }
+
+    kj::Own<kj::ConnectionReceiver> m_receiver;
+    std::optional<size_t> m_max_connections;
+    size_t m_active_connections{0};
+};
+
+template <typename InitInterface, typename InitImpl>
+void _Listen(const std::shared_ptr<Listener>& listener, EventLoop& loop, InitImpl& init)
+{
+    if (listener->atCapacity()) return;
+
+    auto* receiver = listener->m_receiver.get();
+    loop.m_task_set->add(receiver->accept().then(
+        [&loop, &init, listener](kj::Own<kj::AsyncIoStream>&& stream) {
+            ++listener->m_active_connections;
+            _Serve<InitInterface>(loop, kj::mv(stream), init, [&loop, &init, listener] {
+                const bool resume_accept{listener->atCapacity()};
+                assert(listener->m_active_connections > 0);
+                --listener->m_active_connections;
+                if (resume_accept) _Listen<InitInterface>(listener, loop, init);
+            });
+            _Listen<InitInterface>(listener, loop, init);
         }));
 }
 
@@ -738,18 +911,22 @@ template <typename InitInterface, typename InitImpl>
 void ServeStream(EventLoop& loop, int fd, InitImpl& init)
 {
     _Serve<InitInterface>(
-        loop, loop.m_io_context.lowLevelProvider->wrapSocketFd(fd, kj::LowLevelAsyncIoProvider::TAKE_OWNERSHIP), init);
+        loop,
+        loop.m_io_context.lowLevelProvider->wrapSocketFd(fd, kj::LowLevelAsyncIoProvider::TAKE_OWNERSHIP),
+        init,
+        [] {});
 }
 
 //! Given listening socket file descriptor and an init object, handle incoming
 //! connections and requests by calling methods on the Init object.
 template <typename InitInterface, typename InitImpl>
-void ListenConnections(EventLoop& loop, int fd, InitImpl& init)
+void ListenConnections(EventLoop& loop, int fd, InitImpl& init, std::optional<size_t> max_connections = std::nullopt)
 {
     loop.sync([&]() {
-        _Listen<InitInterface>(loop,
+        auto listener{std::make_shared<Listener>(
             loop.m_io_context.lowLevelProvider->wrapListenSocketFd(fd, kj::LowLevelAsyncIoProvider::TAKE_OWNERSHIP),
-            init);
+            max_connections)};
+        _Listen<InitInterface>(listener, loop, init);
     });
 }
 

@@ -83,13 +83,13 @@ class ConfArgsTest(BitcoinTestFramework):
         self.log.debug('Verifying that disabling of the config file means garbage inside of it does ' \
             'not prevent the node from starting, and message about existing config file is logged')
         ignored_file_message = [f'Data directory "{self.nodes[0].datadir_path}" contains a "bitcoin.conf" file which is explicitly ignored using -noconf.']
-        with self.nodes[0].assert_debug_log(timeout=60, expected_msgs=ignored_file_message):
+        with self.nodes[0].assert_debug_log(expected_msgs=ignored_file_message):
             self.start_node(0, extra_args=settings + ['-noconf'])
         self.stop_node(0)
 
         self.log.debug('Verifying no message appears when removing config file')
         os.remove(conf_path)
-        with self.nodes[0].assert_debug_log(timeout=60, expected_msgs=[], unexpected_msgs=ignored_file_message):
+        with self.nodes[0].assert_debug_log(expected_msgs=[], unexpected_msgs=ignored_file_message):
             self.start_node(0, extra_args=settings + ['-noconf'])
         self.stop_node(0)
 
@@ -265,6 +265,21 @@ class ConfArgsTest(BitcoinTestFramework):
             ])
         self.stop_node(0)
 
+    def test_empty_addnode(self):
+        self.log.info("Test empty addnode configuration values are ignored")
+        node = self.nodes[0]
+        util.append_config(node.datadir_path, ["addnode="])
+
+        with node.assert_debug_log(expected_msgs=["Ignoring empty -addnode value"]):
+            # Values consisting of whitespace only are trimmed away by the
+            # config file parser, so they can only be passed on the command
+            # line. Non-empty values are unaffected.
+            self.start_node(0, extra_args=["-addnode= ", "-addnode=some.node"])
+        util.assert_equal([added["addednode"] for added in node.getaddednodeinfo()], ["some.node"])
+        self.stop_node(0)
+
+        node.replace_in_config([("addnode=\n", "")])
+
     def test_networkactive(self):
         self.log.info('Test -networkactive option')
         with self.nodes[0].assert_debug_log(expected_msgs=['SetNetworkActive: true\n']):
@@ -319,19 +334,21 @@ class ConfArgsTest(BitcoinTestFramework):
 
         with self.nodes[0].assert_debug_log(expected_msgs=[
                 "Adding fixed seeds as 60 seconds have passed and addrman is empty",
-        ]):
+        ], timeout=2):
             self.nodes[0].setmocktime(start + 65)
         self.stop_node(0)
 
         # No peers.dat exists and -dnsseed=0
         # We expect the node will fallback immediately to fixed seeds
+        # An empty -addnode value is ignored, so it must not delay the fallback
+        # either.
         assert not peer_dat.exists()
         with self.nodes[0].assert_debug_log(expected_msgs=[
                 "Loaded 0 addresses from peers.dat",
                 "DNS seeding disabled",
                 "Adding fixed seeds as -dnsseed=0 (or IPv4/IPv6 connections are disabled via -onlynet) and neither -addnode nor -seednode are provided\n",
-        ]):
-            self.start_node(0, extra_args=['-dnsseed=0', '-fixedseeds=1'])
+        ], timeout=2):
+            self.start_node(0, extra_args=['-dnsseed=0', '-fixedseeds=1', '-addnode='])
         self.stop_node(0)
         self.nodes[0].assert_start_raises_init_error(['-dnsseed=1', '-onlynet=i2p', '-i2psam=127.0.0.1:7656'], "Error: Incompatible options: -dnsseed=1 was explicitly specified, but -onlynet forbids connections to IPv4/IPv6")
 
@@ -342,7 +359,7 @@ class ConfArgsTest(BitcoinTestFramework):
                 "Loaded 0 addresses from peers.dat",
                 "DNS seeding disabled",
                 "Fixed seeds are disabled",
-        ]):
+        ], timeout=2):
             self.start_node(0, extra_args=['-dnsseed=0', '-fixedseeds=0'])
         self.stop_node(0)
 
@@ -361,7 +378,7 @@ class ConfArgsTest(BitcoinTestFramework):
             self.start_node(0, extra_args=['-dnsseed=0', '-fixedseeds=1', '-addnode=fakenodeaddr', f'-mocktime={start}', UNREACHABLE_PROXY_ARG])
         with self.nodes[0].assert_debug_log(expected_msgs=[
                 "Adding fixed seeds as 60 seconds have passed and addrman is empty",
-        ]):
+        ], timeout=2):
             self.nodes[0].setmocktime(start + 65)
         self.stop_node(0)
 
@@ -386,7 +403,7 @@ class ConfArgsTest(BitcoinTestFramework):
         # If the user did not disable -dnsseed, but it was soft-disabled because they provided -connect,
         # they shouldn't see a warning about -dnsseed being ignored.
         with self.nodes[0].assert_debug_log(expected_msgs=addcon_thread_started,
-                unexpected_msgs=dnsseed_ignored):
+                unexpected_msgs=dnsseed_ignored, timeout=2):
             self.restart_node(0, extra_args=['-connect=fakeaddress1', UNREACHABLE_PROXY_ARG])
 
         # We have to supply expected_msgs as it's a required argument
@@ -394,7 +411,7 @@ class ConfArgsTest(BitcoinTestFramework):
         # These cases test for -connect being supplied but only to disable it
         for connect_arg in ['-connect=0', '-noconnect']:
             with self.nodes[0].assert_debug_log(expected_msgs=addcon_thread_started,
-                    unexpected_msgs=seednode_ignored):
+                    unexpected_msgs=seednode_ignored, timeout=2):
                 self.restart_node(0, extra_args=[connect_arg, '-seednode=fakeaddress2'])
 
             # Make sure -noconnect soft-disables -listen and -dnsseed.
@@ -410,6 +427,29 @@ class ConfArgsTest(BitcoinTestFramework):
             with self.nodes[0].assert_debug_log(expected_msgs=dnsseed_ignored):
                 self.restart_node(0, extra_args=[connect_arg, '-dnsseed', '-proxy=localhost:1080'])
         self.stop_node(0)
+
+    def test_privatebroadcast(self):
+        self.log.info("Test that an invalid usage of -privatebroadcast throws an init error")
+        self.stop_node(0)
+        # -privatebroadcast init error: Tor/I2P not reachable at startup
+        self.nodes[0].assert_start_raises_init_error(
+            extra_args=["-privatebroadcast"],
+            expected_msg=(
+                "Error: Private broadcast of own transactions requested (-privatebroadcast), "
+                "but none of Tor or I2P networks is reachable"))
+        # -privatebroadcast init error: incompatible with -connect
+        self.nodes[0].assert_start_raises_init_error(
+            extra_args=["-privatebroadcast", "-connect=127.0.0.1:8333", "-onion=127.0.0.1:9050"],
+            expected_msg=(
+                "Error: Private broadcast of own transactions requested (-privatebroadcast), but -connect is also configured. "
+                "They are incompatible because the private broadcast needs to open new connections to randomly "
+                "chosen Tor or I2P peers. Consider using -maxconnections=0 -addnode=... instead"))
+        # Warning case: private broadcast allowed, but -proxyrandomize=0 triggers a privacy warning
+        self.start_node(0, extra_args=["-privatebroadcast", "-onion=127.0.0.1:9050", "-proxyrandomize=0"])
+        self.stop_node(0, expected_stderr=(
+            "Warning: Private broadcast of own transactions requested (-privatebroadcast) and "
+            "-proxyrandomize is disabled. Tor circuits for private broadcast connections may "
+            "be correlated to other connections over Tor. To reduce this risk, set -proxyrandomize=1."))
 
     def test_ignored_conf(self):
         self.log.info('Test error is triggered when the datadir in use contains a bitcoin.conf file that would be ignored '
@@ -493,9 +533,11 @@ class ConfArgsTest(BitcoinTestFramework):
     def run_test(self):
         self.test_log_buffer()
         self.test_args_log()
+        self.test_empty_addnode()
         self.test_seed_peers()
         self.test_networkactive()
         self.test_connect_with_seednode()
+        self.test_privatebroadcast()
 
         self.test_dir_config()
         self.test_negated_config()

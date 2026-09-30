@@ -9,22 +9,19 @@
 #include <consensus/amount.h>
 #include <serialize.h>
 #include <util/feefrac.h>
+#include <util/fees.h>
 
 
 #include <cstdint>
 #include <string>
 #include <type_traits>
 
-const std::string CURRENCY_UNIT = "BTC"; // One formatted unit
-const std::string CURRENCY_ATOM = "sat"; // One indivisible minimum value unit
+inline const std::string CURRENCY_UNIT = "BTC"; // One formatted unit
+inline const std::string CURRENCY_ATOM = "sat"; // One indivisible minimum value unit
 
-/* Used to determine type of fee estimation requested */
-enum class FeeEstimateMode {
-    UNSET,        //!< Use default settings based on other criteria
-    ECONOMICAL,   //!< Force estimateSmartFee to use non-conservative estimates
-    CONSERVATIVE, //!< Force estimateSmartFee to use conservative estimates
-    BTC_KVB,      //!< Use BTC/kvB fee rate unit
-    SAT_VB,       //!< Use sat/vB fee rate unit
+enum class FeeRateFormat {
+    BTC_KVB, //!< Use BTC/kvB fee rate unit
+    SAT_VB,  //!< Use sat/vB fee rate unit
 };
 
 /**
@@ -41,7 +38,7 @@ public:
     /** Fee rate of 0 satoshis per 0 vB */
     CFeeRate() = default;
     template<std::integral I> // Disallow silent float -> int conversion
-    explicit CFeeRate(const I m_feerate_kvb) : m_feerate(FeePerVSize(m_feerate_kvb, 1000)) {}
+    explicit constexpr CFeeRate(const I m_feerate_kvb) : m_feerate(FeePerVSize(m_feerate_kvb, 1000)) {}
 
     /**
      * Construct a fee rate from a fee in satoshis and a vsize in vB.
@@ -49,6 +46,15 @@ public:
      * Passing any virtual_bytes less than or equal to 0 will result in 0 fee rate per 0 size.
      */
     CFeeRate(const CAmount& nFeePaid, int32_t virtual_bytes);
+
+    /**
+     * Construct from a fee rate expressed as FeePerVSize.
+     *
+     * Lossless: CFeeRate is internally a FeePerVSize, so the exact
+     * fee/vsize fraction is preserved. A feerate whose size is less than
+     * or equal to 0 results in 0 fee rate per 0 size.
+     */
+    explicit CFeeRate(const FeePerVSize& feerate) : m_feerate{feerate.size > 0 ? feerate : FeePerVSize{}} {}
 
     /**
      * Return the fee in satoshis for the given vsize in vbytes.
@@ -63,19 +69,19 @@ public:
      * Return the fee in satoshis for a vsize of 1000 vbytes
      */
     CAmount GetFeePerK() const { return CAmount(m_feerate.EvaluateFeeDown(1000)); }
-    friend std::weak_ordering operator<=>(const CFeeRate& a, const CFeeRate& b) noexcept
+    friend std::strong_ordering operator<=>(const CFeeRate& a, const CFeeRate& b) noexcept
     {
-        return FeeRateCompare(a.m_feerate, b.m_feerate);
+        return ByRatio{a.m_feerate} <=> ByRatio{b.m_feerate};
     }
     friend bool operator==(const CFeeRate& a, const CFeeRate& b) noexcept
     {
-        return FeeRateCompare(a.m_feerate, b.m_feerate) == std::weak_ordering::equivalent;
+        return ByRatio{a.m_feerate} == ByRatio{b.m_feerate};
     }
     CFeeRate& operator+=(const CFeeRate& a) {
         m_feerate = FeePerVSize(GetFeePerK() + a.GetFeePerK(), 1000);
         return *this;
     }
-    std::string ToString(const FeeEstimateMode& fee_estimate_mode = FeeEstimateMode::BTC_KVB) const;
+    std::string ToString(FeeRateFormat fee_rate_format = FeeRateFormat::BTC_KVB) const;
     friend CFeeRate operator*(const CFeeRate& f, int a) { return CFeeRate(a * f.m_feerate.fee, f.m_feerate.size); }
     friend CFeeRate operator*(int a, const CFeeRate& f) { return CFeeRate(a * f.m_feerate.fee, f.m_feerate.size); }
 

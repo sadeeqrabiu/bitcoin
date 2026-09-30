@@ -6,6 +6,7 @@
 from test_framework.test_framework import BitcoinTestFramework
 from test_framework.util import assert_raises_rpc_error
 
+
 class DeprecatedRpcTest(BitcoinTestFramework):
     def set_test_params(self):
         self.num_nodes = 1
@@ -27,12 +28,18 @@ class DeprecatedRpcTest(BitcoinTestFramework):
 
         # Please don't delete nor modify this comment
         self.log.info("Tests for deprecated RPC methods (if any)")
-
         if self.is_wallet_compiled():
             self.log.info("Tests for deprecated wallet-related RPC methods (if any)")
-            self.log.info("Test settxfee RPC deprecation")
-            self.nodes[0].createwallet("settxfeerpc")
-            assert_raises_rpc_error(-32, 'settxfee is deprecated and will be fully removed in v31.0.', self.nodes[0].settxfee, 0.01)
+            self.nodes[0].createwallet("ancient_wallet")
+            wallet = self.nodes[0].get_wallet_rpc("ancient_wallet")
+
+            self.log.info("Test removeprunedfunds deprecation")
+            assert_raises_rpc_error(
+                -32, "Start bitcoind with the `-deprecatedrpc=removeprunedfunds`",
+                wallet.removeprunedfunds,
+                "fakeargument"
+            )
+
 
 if __name__ == '__main__':
     DeprecatedRpcTest(__file__).main()

@@ -10,6 +10,7 @@
 #include <attributes.h>
 #include <chain.h>
 #include <checkqueue.h>
+#include <coins.h>
 #include <consensus/amount.h>
 #include <cuckoocache.h>
 #include <deploymentstatus.h>
@@ -72,9 +73,9 @@ class SignalInterrupt;
 } // namespace util
 
 /** Block files containing a block-height within MIN_BLOCKS_TO_KEEP of ActiveChain().Tip() will not be pruned. */
-static const unsigned int MIN_BLOCKS_TO_KEEP = 288;
-static const signed int DEFAULT_CHECKBLOCKS = 6;
-static constexpr int DEFAULT_CHECKLEVEL{3};
+inline constexpr unsigned int MIN_BLOCKS_TO_KEEP = 288;
+inline constexpr signed int DEFAULT_CHECKBLOCKS = 6;
+inline constexpr int DEFAULT_CHECKLEVEL{3};
 // Require that user allocate at least 550 MiB for block & undo files (blk???.dat and rev???.dat)
 // At 1MB per block, 288 blocks = 288MB.
 // Add 15% for Undo data = 331MB
@@ -83,10 +84,13 @@ static constexpr int DEFAULT_CHECKLEVEL{3};
 // full block file chunks, we need the high water mark which triggers the prune to be
 // one 128MB block file + added 15% undo data = 147MB greater for a total of 545MB
 // Setting the target to >= 550 MiB will make it likely we can respect the target.
-static const uint64_t MIN_DISK_SPACE_FOR_BLOCK_FILES = 550 * 1024 * 1024;
+inline constexpr uint64_t MIN_DISK_SPACE_FOR_BLOCK_FILES{550_MiB};
 
 /** Maximum number of dedicated script-checking threads allowed */
-static constexpr int MAX_SCRIPTCHECK_THREADS{15};
+inline constexpr int MAX_SCRIPTCHECK_THREADS{15};
+
+/** Maximum number of dedicated threads allowed for prefetching block input prevouts */
+inline constexpr int32_t MAX_PREVOUTFETCH_THREADS{16};
 
 /** Current sync state passed to tip changed callbacks. */
 enum class SynchronizationState {
@@ -244,10 +248,6 @@ struct PackageMempoolAcceptResult
     std::map<Wtxid, MempoolAcceptResult> m_tx_results;
 
     explicit PackageMempoolAcceptResult(PackageValidationState state,
-                                        std::map<Wtxid, MempoolAcceptResult>&& results)
-        : m_state{state}, m_tx_results(std::move(results)) {}
-
-    explicit PackageMempoolAcceptResult(PackageValidationState state, CFeeRate feerate,
                                         std::map<Wtxid, MempoolAcceptResult>&& results)
         : m_state{state}, m_tx_results(std::move(results)) {}
 
@@ -413,8 +413,8 @@ BlockValidationState TestBlockValidity(
     bool check_pow,
     bool check_merkle_root) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
 
-/** Check with the proof of work on each blockheader matches the value in nBits */
-bool HasValidProofOfWork(const std::vector<CBlockHeader>& headers, const Consensus::Params& consensusParams);
+/** Check that the proof of work on each blockheader matches the value in nBits */
+bool HasValidProofOfWork(std::span<const CBlockHeader> headers, const Consensus::Params& consensusParams);
 
 /** Check if a block has been mutated (with respect to its merkle root and witness commitments). */
 bool IsBlockMutated(const CBlock& block, bool check_witness_root);
@@ -454,15 +454,16 @@ enum DisconnectResult
     DISCONNECT_FAILED   // Something else went wrong.
 };
 
-class ConnectTrace;
+struct ConnectedBlock;
 
 /** @see Chainstate::FlushStateToDisk */
-inline constexpr std::array FlushStateModeNames{"NONE", "IF_NEEDED", "PERIODIC", "ALWAYS"};
+inline constexpr std::array FlushStateModeNames{"NONE", "IF_NEEDED", "PERIODIC", "FORCE_FLUSH", "FORCE_SYNC"};
 enum class FlushStateMode: uint8_t {
     NONE,
     IF_NEEDED,
     PERIODIC,
-    ALWAYS
+    FORCE_FLUSH,
+    FORCE_SYNC,
 };
 
 /**
@@ -488,6 +489,10 @@ public:
     //! can fit per the dbcache setting.
     std::unique_ptr<CCoinsViewCache> m_cacheview GUARDED_BY(cs_main);
 
+    //! Reused CoinsViewOverlay layered on top of m_cacheview and passed to ConnectBlock().
+    //! Reset between calls and flushed only on success, so invalid blocks don't pollute the underlying cache.
+    std::unique_ptr<CoinsViewOverlay> m_connect_block_view GUARDED_BY(cs_main);
+
     //! This constructor initializes CCoinsViewDB and CCoinsViewErrorCatcher instances, but it
     //! *does not* create a CCoinsViewCache instance by default. This is done separately because the
     //! presence of the cache has implications on whether or not we're allowed to flush the cache's
@@ -497,7 +502,7 @@ public:
     CoinsViews(DBParams db_params, CoinsViewOptions options);
 
     //! Initialize the CCoinsViewCache member.
-    void InitCache() EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
+    void InitCache(int32_t prevoutfetch_threads) EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
 };
 
 enum class CoinsCacheSizeState
@@ -560,6 +565,12 @@ protected:
 
     //! Cached result of LookupBlockIndex(*m_from_snapshot_blockhash)
     mutable const CBlockIndex* m_cached_snapshot_base GUARDED_BY(::cs_main){nullptr};
+
+    //! Target block for this chainstate. If this is not set, chainstate will
+    //! target the most-work, valid block. If this is set, ChainstateManager
+    //! considers this a "historical" chainstate since it will only contain old
+    //! blocks up to the target block, not newer blocks.
+    std::optional<uint256> m_target_blockhash GUARDED_BY(::cs_main);
 
     //! Cached result of LookupBlockIndex(*m_target_blockhash)
     mutable const CBlockIndex* m_cached_target_block GUARDED_BY(::cs_main){nullptr};
@@ -630,12 +641,6 @@ public:
      */
     const std::optional<uint256> m_from_snapshot_blockhash;
 
-    //! Target block for this chainstate. If this is not set, chainstate will
-    //! target the most-work, valid block. If this is set, ChainstateManager
-    //! considers this a "historical" chainstate since it will only contain old
-    //! blocks up to the target block, not newer blocks.
-    std::optional<uint256> m_target_blockhash GUARDED_BY(::cs_main);
-
     //! Hash of the UTXO set at the target block, computed when the chainstate
     //! reaches the target block, and null before then.
     std::optional<AssumeutxoHash> m_target_utxohash GUARDED_BY(::cs_main);
@@ -649,8 +654,17 @@ public:
 
     //! Return target block which chainstate tip is expected to reach, if this
     //! is a historic chainstate being used to validate a snapshot, or null if
-    //! chainstate targets the most-work block.
+    //! chainstate targets the most-work block. Requires the block index to be
+    //! loaded, so prefer TargetBlockHash() when the block itself is not needed.
     const CBlockIndex* TargetBlock() const EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
+    //! Return hash of the target block, or nullopt if chainstate targets the
+    //! most-work block. Unlike TargetBlock(), does not require the block index
+    //! to be loaded.
+    std::optional<uint256> TargetBlockHash() const EXCLUSIVE_LOCKS_REQUIRED(::cs_main)
+    {
+        AssertLockHeld(::cs_main);
+        return m_target_blockhash;
+    }
     //! Set target block for this chainstate. If null, chainstate will target
     //! the most-work valid block. If non-null chainstate will be a historic
     //! chainstate and target the specified block.
@@ -735,8 +749,8 @@ public:
         FlushStateMode mode,
         int nManualPruneHeight = 0);
 
-    //! Unconditionally flush all changes to disk.
-    void ForceFlushStateToDisk();
+    //! Flush all changes to disk.
+    void ForceFlushStateToDisk(bool wipe_cache = true);
 
     //! Prune blockfiles from the disk if necessary and then flush chainstate changes
     //! if we pruned.
@@ -803,14 +817,16 @@ public:
 
     /** Whether the chain state needs to be redownloaded due to lack of witness data */
     [[nodiscard]] bool NeedsRedownload() const EXCLUSIVE_LOCKS_REQUIRED(cs_main);
-    /** Ensures we have a genesis block in the block tree, possibly writing one to disk. */
-    bool LoadGenesisBlock();
 
+    /** Add a block to the candidate set if it has as much work as the current tip. */
     void TryAddBlockIndexCandidate(CBlockIndex* pindex) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
 
     void PruneBlockIndexCandidates();
 
     void ClearBlockIndexCandidates() EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
+
+    /** Populate the candidate set by calling TryAddBlockIndexCandidate on all valid block indices. */
+    void PopulateBlockIndexCandidates() EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
 
     /** Find the last common block of this chain and a locator. */
     const CBlockIndex* FindForkInGlobalIndex(const CBlockLocator& locator) const EXCLUSIVE_LOCKS_REQUIRED(cs_main);
@@ -829,6 +845,9 @@ public:
 
     std::string ToString() EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
 
+    //! Get the last block that was flushed to disk.
+    const CBlockIndex* GetLastFlushedBlock() const EXCLUSIVE_LOCKS_REQUIRED(::cs_main) { return m_last_flushed_block; }
+
     //! Indirection necessary to make lock annotations work with an optional mempool.
     RecursiveMutex* MempoolMutex() const LOCK_RETURNED(m_mempool->cs)
     {
@@ -841,12 +860,12 @@ public:
     std::pair<int, int> GetPruneRange(int last_height_can_prune) const EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
 
 protected:
-    bool ActivateBestChainStep(BlockValidationState& state, CBlockIndex* pindexMostWork, const std::shared_ptr<const CBlock>& pblock, bool& fInvalidFound, ConnectTrace& connectTrace) EXCLUSIVE_LOCKS_REQUIRED(cs_main, m_mempool->cs);
+    bool ActivateBestChainStep(BlockValidationState& state, CBlockIndex& index_most_work, const std::shared_ptr<const CBlock>& pblock, bool& fInvalidFound, std::vector<ConnectedBlock>& connected_blocks) EXCLUSIVE_LOCKS_REQUIRED(cs_main, m_mempool->cs);
     bool ConnectTip(
         BlockValidationState& state,
         CBlockIndex* pindexNew,
         std::shared_ptr<const CBlock> block_to_connect,
-        ConnectTrace& connectTrace,
+        std::vector<ConnectedBlock>& connected_blocks,
         DisconnectedBlockTransactions& disconnectpool) EXCLUSIVE_LOCKS_REQUIRED(cs_main, m_mempool->cs);
 
     void InvalidBlockFound(CBlockIndex* pindex, const BlockValidationState& state) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
@@ -879,6 +898,7 @@ protected:
         EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
 
     NodeClock::time_point m_next_write{NodeClock::time_point::max()};
+    const CBlockIndex* m_last_flushed_block GUARDED_BY(::cs_main){nullptr};
 
     /**
      * In case of an invalid snapshot, rename the coins leveldb directory so
@@ -1030,13 +1050,13 @@ public:
     ValidationCache m_validation_cache;
 
     /**
-     * Whether initial block download has ended and IsInitialBlockDownload
-     * should return false from now on.
+     * Whether initial block download (IBD) is ongoing.
      *
-     * Mutable because we need to be able to mark IsInitialBlockDownload()
-     * const, which latches this for caching purposes.
+     * This value is used for lock-free IBD checks, and latches from true to
+     * false once block loading has finished and the current chain tip has
+     * enough work and is recent.
      */
-    mutable std::atomic<bool> m_cached_finished_ibd{false};
+    std::atomic_bool m_cached_is_ibd{true};
 
     /**
      * Every received block is assigned a unique and increasing identifier, so we
@@ -1075,6 +1095,9 @@ public:
     //! coins databases. This will be split somehow across chainstates.
     size_t m_total_coinsdb_cache{0};
 
+    /// Ensures a genesis block is in the block tree, possibly writing one to disk.
+    [[nodiscard]] bool LoadGenesisBlock();
+
     //! Instantiate a new chainstate.
     //!
     //! @param[in] mempool              The mempool to pass to the chainstate
@@ -1109,7 +1132,7 @@ public:
     Chainstate& CurrentChainstate() const EXCLUSIVE_LOCKS_REQUIRED(GetMutex())
     {
         for (auto& cs : m_chainstates) {
-            if (cs && cs->m_assumeutxo != Assumeutxo::INVALID && !cs->m_target_blockhash) return *cs;
+            if (cs && cs->m_assumeutxo != Assumeutxo::INVALID && !cs->TargetBlockHash()) return *cs;
         }
         abort();
     }
@@ -1118,7 +1141,7 @@ public:
     Chainstate* HistoricalChainstate() const EXCLUSIVE_LOCKS_REQUIRED(GetMutex())
     {
         for (auto& cs : m_chainstates) {
-            if (cs && cs->m_assumeutxo != Assumeutxo::INVALID && cs->m_target_blockhash && !cs->m_target_utxohash) return cs.get();
+            if (cs && cs->m_assumeutxo != Assumeutxo::INVALID && cs->TargetBlockHash() && !cs->m_target_utxohash) return cs.get();
         }
         return nullptr;
     }
@@ -1157,6 +1180,19 @@ public:
     CBlockIndex* ActiveTip() const EXCLUSIVE_LOCKS_REQUIRED(GetMutex()) { return ActiveChain().Tip(); }
     //! @}
 
+    /**
+     * Update and possibly latch the IBD status.
+     *
+     * If block loading has finished and the current chain tip has enough work
+     * and is recent, set `m_cached_is_ibd` to false. This function never sets
+     * the flag back to true.
+     *
+     * This should be called after operations that may affect IBD exit
+     * conditions (e.g. after updating the active chain tip, or after
+     * `ImportBlocks()` finishes).
+     */
+    void UpdateIBDStatus() EXCLUSIVE_LOCKS_REQUIRED(cs_main);
+
     node::BlockMap& BlockIndex() EXCLUSIVE_LOCKS_REQUIRED(::cs_main)
     {
         AssertLockHeld(::cs_main);
@@ -1169,10 +1205,16 @@ public:
     mutable VersionBitsCache m_versionbitscache;
 
     /** Check whether we are doing an initial block download (synchronizing from disk or network) */
-    bool IsInitialBlockDownload() const;
+    bool IsInitialBlockDownload() const noexcept;
 
-    /** Guess verification progress (as a fraction between 0.0=genesis and 1.0=current tip). */
+    /** Guess verification progress (as a fraction between 0.0=genesis and 1.0=current tip).
+    * This is also the case in the assumeutxo context, meaning that the progress reported for
+    * the snapshot chainstate may suggest that all historical blocks have already been verified
+    * even though that may not actually be the case. */
     double GuessVerificationProgress(const CBlockIndex* pindex) const EXCLUSIVE_LOCKS_REQUIRED(GetMutex());
+
+    /** Guess background verification progress in case assume-utxo was used (as a fraction between 0.0=genesis and 1.0=snapshot blocks). */
+    double GetBackgroundVerificationProgress(const CBlockIndex& pindex) const EXCLUSIVE_LOCKS_REQUIRED(GetMutex());
 
     /**
      * Import blocks from an external file
@@ -1292,13 +1334,13 @@ public:
     void UpdateUncommittedBlockStructures(CBlock& block, const CBlockIndex* pindexPrev) const;
 
     /** Produce the necessary coinbase commitment for a block (modifies the hash, don't call for mined blocks). */
-    std::vector<unsigned char> GenerateCoinbaseCommitment(CBlock& block, const CBlockIndex* pindexPrev) const;
+    void GenerateCoinbaseCommitment(CBlock& block, const CBlockIndex* pindexPrev) const;
 
     /** This is used by net_processing to report pre-synchronization progress of headers, as
      *  headers are not yet fed to validation during that time, but validation is (for now)
      *  responsible for logging and signalling through NotifyHeaderTip, so it needs this
      *  information. */
-    void ReportHeadersPresync(const arith_uint256& work, int64_t height, int64_t timestamp);
+    void ReportHeadersPresync(int64_t height, int64_t timestamp);
 
     //! When starting up, search the datadir for a chainstate based on a UTXO
     //! snapshot that is in the process of being validated and load it if found.
@@ -1335,6 +1377,10 @@ public:
     //! best header is no longer valid / guaranteed to be the most-work
     //! header in our block-index not known to be invalid, recalculate it.
     void RecalculateBestHeader() EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
+
+    //! Returns how many blocks the best header is ahead of the current tip,
+    //! or nullopt if the best header does not extend the tip.
+    std::optional<int> BlocksAheadOfTip() const LOCKS_EXCLUDED(::cs_main);
 
     CCheckQueue<CScriptCheck>& GetCheckQueue() { return m_script_check_queue; }
 

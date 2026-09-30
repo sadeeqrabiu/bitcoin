@@ -7,11 +7,29 @@ import argparse
 import hashlib
 import logging
 import os
+from pathlib import Path
 import subprocess
 import sys
 import time
 
 GIT = os.getenv('GIT', 'git')
+
+def is_ancestor(older, newer, root_name):
+    """Return whether older is an ancestor of newer, rejecting Git errors."""
+    result = subprocess.run([GIT, "merge-base", "--is-ancestor", older, newer])
+    if result.returncode not in (0, 1):
+        print(f'Failed to determine ancestry between "{older}" and "{newer}" for the {root_name} (git merge-base exited with {result.returncode}).', file=sys.stderr)
+        sys.exit(1)
+    return result.returncode == 0
+
+def predates(commit, root, root_name):
+    """Return whether commit is provably older than root, rejecting divergent history."""
+    if is_ancestor(root, commit, root_name):
+        return False
+    elif is_ancestor(commit, root, root_name):
+        return True
+    print(f'"{commit}" diverges from the {root_name} "{root}", refusing to verify.', file=sys.stderr)
+    sys.exit(1)
 
 def tree_sha512sum(commit='HEAD'):
     """Calculate the Tree-sha512 for the commit.
@@ -80,20 +98,14 @@ def main():
     args = parser.parse_args()
 
     # get directory of this program and read data files
-    dirname = os.path.dirname(os.path.abspath(__file__))
-    print("Using verify-commits data from " + dirname)
-    with open(dirname + "/trusted-git-root", "r") as f:
-        verified_root = f.read().splitlines()[0]
-    with open(dirname + "/trusted-sha512-root-commit", "r") as f:
-        verified_sha512_root = f.read().splitlines()[0]
-    with open(dirname + "/allow-revsig-commits", "r") as f:
-        revsig_allowed = f.read().splitlines()
-    with open(dirname + "/allow-unclean-merge-commits", "r") as f:
-        unclean_merge_allowed = f.read().splitlines()
-    with open(dirname + "/allow-incorrect-sha512-commits", "r") as f:
-        incorrect_sha512_allowed = f.read().splitlines()
-    with open(dirname + "/trusted-keys", "r") as f:
-        trusted_keys = f.read().splitlines()
+    dirname = Path(__file__).absolute().parent
+    print(f"Using verify-commits data from {dirname}")
+    verified_root = (dirname / "trusted-git-root").read_text().splitlines()[0]
+    verified_sha512_root = (dirname / "trusted-sha512-root-commit").read_text().splitlines()[0]
+    revsig_allowed = (dirname / "allow-revsig-commits").read_text().splitlines()
+    unclean_merge_allowed = (dirname / "allow-unclean-merge-commits").read_text().splitlines()
+    incorrect_sha512_allowed = (dirname / "allow-incorrect-sha512-commits").read_text().splitlines()
+    trusted_keys = (dirname / "trusted-keys").read_text().splitlines()
 
     # Set commit and variables
     current_commit = args.commit
@@ -112,27 +124,23 @@ def main():
         logging.debug("verify-commits: [in-progress] processing commit {}".format(current_commit[:8]))
 
         if current_commit == verified_root:
+            # Ensure the trusted root identifies an existing commit.
+            is_ancestor(verified_root, current_commit, "trusted Git root")
             print('There is a valid path from "{}" to {} where all commits are signed!'.format(initial_commit, verified_root))
             sys.exit(0)
-        else:
-            # Make sure this commit isn't older than trusted roots
-            check_root_older_res = subprocess.run([GIT, "merge-base", "--is-ancestor", verified_root, current_commit])
-            if check_root_older_res.returncode != 0:
-                print(f"\"{current_commit}\" predates the trusted root, stopping!")
-                sys.exit(0)
+        elif predates(current_commit, verified_root, "trusted Git root"):
+            print(f"\"{current_commit}\" predates the trusted root, stopping!")
+            sys.exit(0)
 
         if verify_tree:
             if current_commit == verified_sha512_root:
                 print("All Tree-SHA512s matched up to {}".format(verified_sha512_root), file=sys.stderr)
                 verify_tree = False
                 no_sha1 = False
-            else:
-                # Skip the tree check if we are older than the trusted root
-                check_root_older_res = subprocess.run([GIT, "merge-base", "--is-ancestor", verified_sha512_root, current_commit])
-                if check_root_older_res.returncode != 0:
-                    print(f"\"{current_commit}\" predates the trusted SHA512 root, disabling tree verification.")
-                    verify_tree = False
-                    no_sha1 = False
+            elif predates(current_commit, verified_sha512_root, "trusted Tree-SHA512 root"):
+                print(f"\"{current_commit}\" predates the trusted SHA512 root, disabling tree verification.")
+                verify_tree = False
+                no_sha1 = False
 
 
         os.environ['BITCOIN_VERIFY_COMMITS_ALLOW_SHA1'] = "0" if no_sha1 else "1"

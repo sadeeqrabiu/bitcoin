@@ -6,10 +6,10 @@
 #define BITCOIN_WALLET_SPEND_H
 
 #include <consensus/amount.h>
-#include <policy/fees/block_policy_estimator.h>
 #include <util/result.h>
 #include <wallet/coinselection.h>
 #include <wallet/transaction.h>
+#include <wallet/types.h>
 #include <wallet/wallet.h>
 
 #include <map>
@@ -23,7 +23,7 @@ namespace wallet {
 /** Get the marginal bytes if spending the specified output from this transaction.
  * Use CoinControl to determine whether to expect signature grinding when calculating the size of the input spend. */
 int CalculateMaximumSignedInputSize(const CTxOut& txout, const CWallet* pwallet, const CCoinControl* coin_control);
-int CalculateMaximumSignedInputSize(const CTxOut& txout, const COutPoint outpoint, const SigningProvider* pwallet, bool can_grind_r, const CCoinControl* coin_control);
+int CalculateMaximumSignedInputSize(const CTxOut& txout, COutPoint outpoint, const SigningProvider* pwallet, bool can_grind_r, const CCoinControl* coin_control);
 struct TxSize {
     int64_t vsize{-1};
     int64_t weight{-1};
@@ -39,7 +39,7 @@ TxSize CalculateMaximumSignedTxSize(const CTransaction& tx, const CWallet* walle
  * This struct is really just a wrapper around OutputType vectors with a convenient
  * method for concatenating and returning all COutputs as one vector.
  *
- * Size(), Clear(), Erase(), Shuffle(), and Add() methods are implemented to
+ * Size(), Erase(), Shuffle(), and Add() methods are implemented to
  * allow easy interaction with the struct.
  */
 struct CoinsResult {
@@ -53,19 +53,22 @@ struct CoinsResult {
     size_t Size() const;
     /** Return how many different output types this struct stores */
     size_t TypesCount() const { return coins.size(); }
-    void Clear();
     void Erase(const std::unordered_set<COutPoint, SaltedOutpointHasher>& coins_to_remove);
     void Shuffle(FastRandomContext& rng_fast);
     void Add(OutputType type, const COutput& out);
 
-    CAmount GetTotalAmount() { return total_amount; }
-    std::optional<CAmount> GetEffectiveTotalAmount() {return total_effective_amount; }
+    CAmount GetTotalAmount() const { return total_amount; }
+    std::optional<CAmount> GetEffectiveTotalAmount() const { return total_effective_amount; }
+    // Returns the appropriate total based on whether fees are being subtracted from outputs
+    std::optional<CAmount> GetAppropriateTotal(bool subtract_fee_outputs) const {
+        return subtract_fee_outputs ? total_amount : total_effective_amount;
+    }
 
 private:
     /** Sum of all available coins raw value */
     CAmount total_amount{0};
     /** Sum of all available coins effective value (each output value minus fees required to spend it) */
-    std::optional<CAmount> total_effective_amount{0};
+    std::optional<CAmount> total_effective_amount;
 };
 
 struct CoinFilterParams {
@@ -118,6 +121,15 @@ FilteredOutputGroups GroupOutputs(const CWallet& wallet,
                           const std::vector<SelectionFilter>& filters);
 
 /**
+ * Group coins by the provided filters, groups that pass no filter are appended to `ret_discarded_groups`.
+ */
+FilteredOutputGroups GroupOutputs(const CWallet& wallet,
+                                  const CoinsResult& coins,
+                                  const CoinSelectionParams& coin_sel_params,
+                                  const std::vector<SelectionFilter>& filters,
+                                  std::vector<OutputGroup>& ret_discarded_groups);
+
+/**
  * Attempt to find a valid input set that preserves privacy by not mixing OutputTypes.
  * `ChooseSelectionResult()` will be called on each OutputType individually and the best
  * the solution (according to the waste metric) will be chosen. If a valid input cannot be found from any
@@ -152,31 +164,11 @@ util::Result<SelectionResult> AttemptSelection(interfaces::Chain& chain, const C
  */
 util::Result<SelectionResult> ChooseSelectionResult(interfaces::Chain& chain, const CAmount& nTargetValue, Groups& groups, const CoinSelectionParams& coin_selection_params);
 
-// User manually selected inputs that must be part of the transaction
-struct PreSelectedInputs
-{
-    std::set<std::shared_ptr<COutput>> coins;
-    // If subtract fee from outputs is disabled, the 'total_amount'
-    // will be the sum of each output effective value
-    // instead of the sum of the outputs amount
-    CAmount total_amount{0};
-
-    void Insert(const COutput& output, bool subtract_fee_outputs)
-    {
-        if (subtract_fee_outputs) {
-            total_amount += output.txout.nValue;
-        } else {
-            total_amount += output.GetEffectiveValue();
-        }
-        coins.insert(std::make_shared<COutput>(output));
-    }
-};
-
 /**
  * Fetch and validate coin control selected inputs.
  * Coins could be internal (from the wallet) or external.
 */
-util::Result<PreSelectedInputs> FetchSelectedInputs(const CWallet& wallet, const CCoinControl& coin_control,
+util::Result<CoinsResult> FetchSelectedInputs(const CWallet& wallet, const CCoinControl& coin_control,
                                                     const CoinSelectionParams& coin_selection_params) EXCLUSIVE_LOCKS_REQUIRED(wallet.cs_wallet);
 
 /**
@@ -198,20 +190,9 @@ util::Result<SelectionResult> AutomaticCoinSelection(const CWallet& wallet, Coin
  * Select all coins from coin_control, and if coin_control 'm_allow_other_inputs=true', call 'AutomaticCoinSelection' to
  * select a set of coins such that nTargetValue - pre_set_inputs.total_amount is met.
  */
-util::Result<SelectionResult> SelectCoins(const CWallet& wallet, CoinsResult& available_coins, const PreSelectedInputs& pre_set_inputs,
+util::Result<SelectionResult> SelectCoins(const CWallet& wallet, CoinsResult& available_coins, const CoinsResult& pre_set_inputs,
                                           const CAmount& nTargetValue, const CCoinControl& coin_control,
                                           const CoinSelectionParams& coin_selection_params) EXCLUSIVE_LOCKS_REQUIRED(wallet.cs_wallet);
-
-struct CreatedTransactionResult
-{
-    CTransactionRef tx;
-    CAmount fee;
-    FeeCalculation fee_calc;
-    std::optional<unsigned int> change_pos;
-
-    CreatedTransactionResult(CTransactionRef _tx, CAmount _fee, std::optional<unsigned int> _change_pos, const FeeCalculation& _fee_calc)
-        : tx(_tx), fee(_fee), fee_calc(_fee_calc), change_pos(_change_pos) {}
-};
 
 /**
  * Set a height-based locktime for new transactions (uses the height of the

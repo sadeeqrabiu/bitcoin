@@ -30,9 +30,6 @@ EXPECTED_BOOST_INCLUDES = [
                            "boost/multi_index/tag.hpp",
                            "boost/multi_index_container.hpp",
                            "boost/operators.hpp",
-                           "boost/signals2/connection.hpp",
-                           "boost/signals2/optional_last_value.hpp",
-                           "boost/signals2/signal.hpp",
                            "boost/test/included/unit_test.hpp",
                            "boost/test/unit_test.hpp",
                            "boost/tuple/tuple.hpp",
@@ -73,7 +70,11 @@ def find_included_cpps():
         if e.returncode > 1:
             raise e
 
-    return included_cpps
+    # Exception: `#include <moc_*.cpp>` statements in src/qt source files are permitted.
+    # See:
+    # - https://doc.qt.io/qt-6/moc.html
+    # - https://cmake.org/cmake/help/latest/prop_tgt/AUTOMOC.html
+    return [i for i in included_cpps if not re.match(r"src/qt/[^:]+\.cpp:#include <moc_[^<>:]+\.cpp>$", i)]
 
 
 def find_extra_boosts():

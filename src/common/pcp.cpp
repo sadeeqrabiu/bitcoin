@@ -4,18 +4,30 @@
 
 #include <common/pcp.h>
 
-#include <common/netif.h>
+#include <compat/compat.h>
 #include <crypto/common.h>
-#include <logging.h>
+#include <crypto/hex_base.h>
 #include <netaddress.h>
 #include <netbase.h>
-#include <random.h>
-#include <span.h>
+#include <tinyformat.h>
 #include <util/check.h>
-#include <util/readwritefile.h>
+#include <util/log.h>
 #include <util/sock.h>
-#include <util/strencodings.h>
+#include <util/string.h>
 #include <util/threadinterrupt.h>
+#include <util/time.h>
+
+#include <algorithm>
+#include <atomic>
+#include <compare>
+#include <cstring>
+#include <functional>
+#include <map>
+#include <memory>
+#include <optional>
+#include <span>
+#include <utility>
+#include <vector>
 
 namespace {
 
@@ -81,6 +93,8 @@ constexpr size_t NATPMP_MAP_RESPONSE_LIFETIME_OFS = 12;
 constexpr uint8_t NATPMP_RESULT_SUCCESS = 0;
 //! Result code representing unsupported version.
 constexpr uint8_t NATPMP_RESULT_UNSUPP_VERSION = 1;
+//! Result code representing not authorized (router doesn't support port mapping).
+constexpr uint8_t NATPMP_RESULT_NOT_AUTHORIZED = 2;
 //! Result code representing lack of resources.
 constexpr uint8_t NATPMP_RESULT_NO_RESOURCES = 4;
 
@@ -144,6 +158,8 @@ constexpr size_t PCP_MAP_EXTERNAL_IP_OFS = 20;
 
 //! Result code representing success (RFC6887 7.4), shared with NAT-PMP.
 constexpr uint8_t PCP_RESULT_SUCCESS = NATPMP_RESULT_SUCCESS;
+//! Result code representing not authorized (RFC6887 7.4), shared with NAT-PMP.
+constexpr uint8_t PCP_RESULT_NOT_AUTHORIZED = NATPMP_RESULT_NOT_AUTHORIZED;
 //! Result code representing lack of resources (RFC6887 7.4).
 constexpr uint8_t PCP_RESULT_NO_RESOURCES = 8;
 
@@ -242,7 +258,7 @@ std::optional<std::vector<uint8_t>> PCPSendRecv(Sock &sock, const std::string &p
         while ((cur_time = time_point_cast<milliseconds>(MockableSteadyClock::now())) < deadline) {
             if (interrupt) return std::nullopt;
             Sock::Event occurred = 0;
-            if (!sock.Wait(deadline - cur_time, Sock::RECV, &occurred)) {
+            if (!sock.Wait(deadline - cur_time, Sock::RecvEvent, &occurred)) {
                 LogWarning("%s: Could not wait on socket: %s\n", protocol, NetworkErrorString(WSAGetLastError()));
                 return std::nullopt; // Network-level error, probably no use retrying.
             }
@@ -374,7 +390,16 @@ std::variant<MappingResult, MappingError> NATPMPRequestPortMap(const CNetAddr &g
         Assume(response.size() >= NATPMP_MAP_RESPONSE_SIZE);
         uint16_t result_code = ReadBE16(response.data() + NATPMP_RESPONSE_HDR_RESULT_OFS);
         if (result_code != NATPMP_RESULT_SUCCESS) {
-            LogWarning("natpmp: Port mapping failed with result %s\n", NATPMPResultString(result_code));
+            if (result_code == NATPMP_RESULT_NOT_AUTHORIZED) {
+                static std::atomic<bool> warned{false};
+                if (!warned.exchange(true)) {
+                    LogWarning("natpmp: Port mapping failed with result %s\n", NATPMPResultString(result_code));
+                } else {
+                    LogDebug(BCLog::NET, "natpmp: Port mapping failed with result %s\n", NATPMPResultString(result_code));
+                }
+            } else {
+                LogWarning("natpmp: Port mapping failed with result %s\n", NATPMPResultString(result_code));
+            }
             if (result_code == NATPMP_RESULT_NO_RESOURCES) {
                 return MappingError::NO_RESOURCES;
             }
@@ -508,7 +533,16 @@ std::variant<MappingResult, MappingError> PCPRequestPortMap(const PCPMappingNonc
     uint16_t external_port = ReadBE16(response.data() + PCP_HDR_SIZE + PCP_MAP_EXTERNAL_PORT_OFS);
     CNetAddr external_addr{PCPUnwrapAddress(response.subspan(PCP_HDR_SIZE + PCP_MAP_EXTERNAL_IP_OFS, ADDR_IPV6_SIZE))};
     if (result_code != PCP_RESULT_SUCCESS) {
-        LogWarning("pcp: Mapping failed with result %s\n", PCPResultString(result_code));
+        if (result_code == PCP_RESULT_NOT_AUTHORIZED) {
+            static std::atomic<bool> warned{false};
+            if (!warned.exchange(true)) {
+                LogWarning("pcp: Mapping failed with result %s\n", PCPResultString(result_code));
+            } else {
+                LogDebug(BCLog::NET, "pcp: Mapping failed with result %s\n", PCPResultString(result_code));
+            }
+        } else {
+            LogWarning("pcp: Mapping failed with result %s\n", PCPResultString(result_code));
+        }
         if (result_code == PCP_RESULT_NO_RESOURCES) {
             return MappingError::NO_RESOURCES;
         }

@@ -11,11 +11,11 @@
 #include <common/system.h>
 #include <kernel/context.h>
 #include <kernel/warning.h>
-#include <logging.h>
 #include <node/abort.h>
 #include <node/interface_ui.h>
 #include <node/warnings.h>
 #include <util/check.h>
+#include <util/log.h>
 #include <util/signalinterrupt.h>
 #include <util/strencodings.h>
 #include <util/string.h>
@@ -53,7 +53,7 @@ kernel::InterruptResult KernelNotifications::blockTip(SynchronizationState state
     {
         LOCK(m_tip_block_mutex);
         Assume(index.GetBlockHash() != uint256::ZERO);
-        m_tip_block = index.GetBlockHash();
+        m_state.tip_block = index.GetBlockHash();
         m_tip_block_cv.notify_all();
     }
 
@@ -103,7 +103,7 @@ void KernelNotifications::fatalError(const bilingual_str& message)
 std::optional<uint256> KernelNotifications::TipBlock()
 {
     AssertLockHeld(m_tip_block_mutex);
-    return m_tip_block;
+    return m_state.tip_block;
 };
 
 

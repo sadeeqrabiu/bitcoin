@@ -17,7 +17,7 @@ def run(cmd, **kwargs):
     try:
         return subprocess.run(cmd, **kwargs)
     except Exception as e:
-        sys.exit(e)
+        sys.exit(str(e))
 
 
 def main():
@@ -58,14 +58,6 @@ def main():
 
         # Modify PATH to prepend the retry script, needed for CI_RETRY_EXE
         os.environ["PATH"] = f"{os.environ['BASE_ROOT_DIR']}/ci/retry:{os.environ['PATH']}"
-        # GNU getopt is required for the CI_RETRY_EXE script
-        if os.getenv("CI_OS_NAME") == "macos":
-            prefix = run(
-                ["brew", "--prefix", "gnu-getopt"],
-                stdout=subprocess.PIPE,
-                text=True,
-            ).stdout.strip()
-            os.environ["IN_GETOPT_BIN"] = f"{prefix}/bin/getopt"
     else:
         CI_IMAGE_LABEL = "bitcoin-ci-test"
 
@@ -123,6 +115,7 @@ def main():
             CI_CCACHE_MOUNT = f"type=bind,src={os.environ['CCACHE_DIR']},dst={os.environ['CCACHE_DIR']}"
 
         run(["docker", "network", "create", "--ipv6", "--subnet", "1111:1111::/112", "ci-ip6net"], check=False)
+        run(["docker", "network", "create", "--subnet", "1.1.1.0/24", "ci-ip4net"], check=False)
 
         if os.getenv("RESTART_CI_DOCKER_BEFORE_RUN"):
             print("Restart docker before run to stop and clear all containers started with --rm")
@@ -152,6 +145,7 @@ def main():
             f"--env-file={env_file}",
             f"--name={os.environ['CONTAINER_NAME']}",
             "--network=ci-ip6net",
+            "--ip6=1111:1111::5", # Used by some of the tests, don't change it just here (keep them in sync).
             f"--platform={os.environ['CI_IMAGE_PLATFORM']}",
             os.environ["CONTAINER_NAME"],
         ]
@@ -162,11 +156,19 @@ def main():
             text=True,
         ).stdout.strip()
 
+        run(["docker", "network", "connect", "--ip=1.1.1.5", "ci-ip4net", container_id]) # The IP address is used by some of the tests, don't change it just here (keep them in sync).
+
     def ci_exec(cmd_inner, **kwargs):
         if os.getenv("DANGER_RUN_CI_ON_HOST"):
             prefix = []
         else:
-            prefix = ["docker", "exec", container_id]
+            prefix = [
+                "docker",
+                "exec",
+                "--env",
+                "DANGER_RUN_CI_ON_HOST=1",  # Safe to set *inside* the container
+                container_id,
+            ]
 
         return run([*prefix, *cmd_inner], **kwargs)
 
@@ -181,7 +183,18 @@ def main():
         f"{os.environ['BASE_ROOT_DIR']}",
     ])
     ci_exec([f"{os.environ['BASE_ROOT_DIR']}/ci/test/01_base_install.sh"])
-    ci_exec([f"{os.environ['BASE_ROOT_DIR']}/ci/test/03_test_script.sh"])
+    test_script = f"{os.environ['BASE_ROOT_DIR']}/ci/test/03_test_script.sh"
+    if os.environ.get("HOST", "").startswith("x86_64-w64-mingw32"):
+        ci_exec([
+            "env",
+            "NIX_BUILD_SHELL=bash",
+            "nix-shell",
+            f"{os.environ['BASE_ROOT_DIR']}/contrib/devtools/shell-win64-cross.nix",
+            "--run",
+            f"echo 'Windows cross compiler:' && \"$CXX\" -v && exec bash {shlex.quote(test_script)}",
+        ])
+    else:
+        ci_exec([test_script])
 
     if not os.getenv("DANGER_RUN_CI_ON_HOST"):
         print("Stop and remove CI container by ID")

@@ -156,7 +156,7 @@ As an alternative to fetching commits directly, when looking at pull requests by
         url = git@github.com:bitcoin/bitcoin.git
 ```
 
-This will add an `upstream-pull` remote to your git repository, which can be fetched using `git fetch --all` or `git fetch upstream-pull`. It will download and store on disk quite a lot of data (all PRs, including merged and closed ones). Afterwards, you can use `upstream-pull/NUMBER/head` in arguments to `git show`, `git checkout` and anywhere a commit id would be acceptable to see the changes from pull request NUMBER.
+This will add an `upstream-pull` remote to your git repository, which can be fetched using `git fetch --all` or `git fetch upstream-pull`. It will download and store on disk quite a lot of data (all PRs, including merged and closed ones). Afterwards, you can use `upstream-pull/NUMBER` in arguments to `git show`, `git checkout` and anywhere a commit id would be acceptable to see the changes from pull request NUMBER.
 
 ### Fetch and update PRs individually
 
@@ -191,7 +191,12 @@ Then a simple `git pr 12345` will fetch and check out that pr from upstream.
 
 ### Diff the diffs with `git range-diff`
 
-It is very common for contributors to rebase their pull requests, or make changes to commits (perhaps in response to review) that are not at the head of their branch. This poses a problem for reviewers as when the contributor force pushes, the reviewer is no longer sure that his previous reviews of commits are still valid (as the commit hashes can now be different even though the diff is semantically the same). [git range-diff](https://git-scm.com/docs/git-range-diff) (Git >= 2.19) can help solve this problem by diffing the diffs.
+It is very common for contributors to rebase their pull requests, or make changes to commits (perhaps in response to review) that are not at the head of their branch. This poses a problem for reviewers as when the contributor force pushes, the reviewer is no longer sure that their previous reviews of commits are still valid (as the commit hashes can now be different even though the diff is semantically the same). [git range-diff](https://git-scm.com/docs/git-range-diff) (Git >= 2.19) can help solve this problem by diffing the diffs.
+
+> [!NOTE]
+> If `git range-diff` cannot match a commit in the old range to a commit in the new range, it will show it as "removed" (`<`) and "added" (`>`), without showing the patch contents.
+> This does not mean there were no code changes.
+> It means the commit was considered unrelated, and should be reviewed in full like a new commit.
 
 For example, to identify the differences between your previously reviewed diffs P1-5, and the new diffs P1-2,N3-4 as illustrated below:
 ```
@@ -205,6 +210,12 @@ For example, to identify the differences between your previously reviewed diffs 
 You can do:
 ```sh
 git range-diff master previously-reviewed-head new-head
+```
+
+If you expected `git range-diff` to match a commit, but it shows it as a deletion and an addition, try re-running with a higher creation factor:
+
+```sh
+git range-diff --creation-factor=95 <old_range> <new_range>
 ```
 
 Note that `git range-diff` also works for rebases:

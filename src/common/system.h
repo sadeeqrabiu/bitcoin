@@ -8,12 +8,14 @@
 
 #include <bitcoin-build-config.h> // IWYU pragma: keep
 
+#include <util/time.h>
+
 #include <cstdint>
 #include <optional>
 #include <string>
 
-// Application startup time (used for uptime calculation)
-int64_t GetStartupTime();
+/// Monotonic uptime (not affected by system time changes).
+SteadyClock::duration GetUptime();
 
 void SetupEnvironment();
 [[nodiscard]] bool SetupNetworking();
@@ -33,6 +35,6 @@ int GetNumCores();
 /**
  * Return the total RAM available on the current system, if detectable.
  */
-std::optional<size_t> GetTotalRAM();
+std::optional<uint64_t> TryGetTotalRam();
 
 #endif // BITCOIN_COMMON_SYSTEM_H

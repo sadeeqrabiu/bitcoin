@@ -290,6 +290,8 @@ bool hasEntryData(const QAbstractItemView *view, int column, int role)
 
 void LoadFont(const QString& file_name)
 {
+    // The qminimal plugin does not provide font loading support.
+    if (QApplication::platformName() == "minimal") return;
     const int id = QFontDatabase::addApplicationFont(file_name);
     assert(id != -1);
 }
@@ -722,11 +724,13 @@ QString ConnectionTypeToQString(ConnectionType conn_type, bool prepend_direction
     case ConnectionType::FEELER: return prefix + QObject::tr("Feeler");
     //: Short-lived peer connection type that solicits known addresses from a peer.
     case ConnectionType::ADDR_FETCH: return prefix + QObject::tr("Address Fetch");
+    //: Short-lived peer connection type that is used for broadcasting privacy-sensitive data.
+    case ConnectionType::PRIVATE_BROADCAST: return prefix + QObject::tr("Private Broadcast");
     } // no default case, so the compiler can warn about missing cases
     assert(false);
 }
 
-QString formatDurationStr(std::chrono::seconds dur)
+QString formatDurationStr(std::chrono::nanoseconds dur)
 {
     const auto d{std::chrono::duration_cast<std::chrono::days>(dur)};
     const auto h{std::chrono::duration_cast<std::chrono::hours>(dur - d)};
@@ -741,10 +745,9 @@ QString formatDurationStr(std::chrono::seconds dur)
     return str_list.join(" ");
 }
 
-QString FormatPeerAge(std::chrono::seconds time_connected)
+QString FormatPeerAge(NodeClock::time_point connected)
 {
-    const auto time_now{GetTime<std::chrono::seconds>()};
-    const auto age{time_now - time_connected};
+    const auto age{NodeClock::now() - connected};
     if (age >= 24h) return QObject::tr("%1 d").arg(age / 24h);
     if (age >= 1h) return QObject::tr("%1 h").arg(age / 1h);
     if (age >= 1min) return QObject::tr("%1 m").arg(age / 1min);
@@ -765,11 +768,11 @@ QString formatServicesStr(quint64 mask)
         return QObject::tr("None");
 }
 
-QString formatPingTime(std::chrono::microseconds ping_time)
+QString formatPingTime(NodeClock::duration ping_time)
 {
-    return (ping_time == std::chrono::microseconds::max() || ping_time == 0us) ?
+    return (ping_time == decltype(CNode::m_min_ping_time.load())::max() || ping_time == 0us) ?
         QObject::tr("N/A") :
-        QObject::tr("%1 ms").arg(QString::number((int)(count_microseconds(ping_time) / 1000), 10));
+        QObject::tr("%1 ms").arg(QString::number(Ticks<std::chrono::milliseconds>(ping_time)));
 }
 
 QString formatTimeOffset(int64_t time_offset)
@@ -969,7 +972,11 @@ void PrintSlotException(
 {
     std::string description = sender->metaObject()->className();
     description += "->";
-    description += receiver->metaObject()->className();
+    if (receiver) {
+        description += receiver->metaObject()->className();
+    } else {
+        description += "anonymous function";
+    }
     PrintExceptionContinue(exception, description);
 }
 

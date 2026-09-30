@@ -7,17 +7,17 @@
 
 #include <common/system.h>
 
-#include <logging.h>
+#include <util/log.h>
 #include <util/string.h>
 #include <util/time.h>
 
 #ifdef WIN32
-#include <cassert>
-#include <codecvt>
 #include <compat/compat.h>
+#include <util/check.h>
 #include <windows.h>
 #else
 #include <sys/stat.h>
+#include <sys/types.h>
 #include <unistd.h>
 #endif
 
@@ -25,8 +25,6 @@
 #include <malloc.h>
 #endif
 
-#include <algorithm>
-#include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <locale>
@@ -36,9 +34,6 @@
 #include <thread>
 
 using util::ReplaceAll;
-
-// Application startup time (used for uptime calculation)
-const int64_t nStartupTime = GetTime();
 
 #ifndef WIN32
 std::string ShellEscape(const std::string& arg)
@@ -53,11 +48,7 @@ std::string ShellEscape(const std::string& arg)
 void runCommand(const std::string& strCommand)
 {
     if (strCommand.empty()) return;
-#ifndef WIN32
     int nErr = ::system(strCommand.c_str());
-#else
-    int nErr = ::_wsystem(std::wstring_convert<std::codecvt_utf8_utf16<wchar_t>,wchar_t>().from_bytes(strCommand).c_str());
-#endif
     if (nErr) {
         LogWarning("runCommand error: system(%s) returned %d", strCommand, nErr);
     }
@@ -114,24 +105,21 @@ int GetNumCores()
     return std::thread::hardware_concurrency();
 }
 
-std::optional<size_t> GetTotalRAM()
+std::optional<uint64_t> TryGetTotalRam()
 {
-    [[maybe_unused]] auto clamp{[](uint64_t v) { return size_t(std::min(v, uint64_t{std::numeric_limits<size_t>::max()})); }};
+    static const auto total_ram{[]() -> std::optional<uint64_t> {
 #ifdef WIN32
-    if (MEMORYSTATUSEX m{}; (m.dwLength = sizeof(m), GlobalMemoryStatusEx(&m))) return clamp(m.ullTotalPhys);
-#elif defined(__APPLE__) || \
-      defined(__FreeBSD__) || \
-      defined(__NetBSD__) || \
-      defined(__OpenBSD__) || \
-      defined(__illumos__) || \
-      defined(__linux__)
-    if (long p{sysconf(_SC_PHYS_PAGES)}, s{sysconf(_SC_PAGESIZE)}; p > 0 && s > 0) return clamp(1ULL * p * s);
+        if (MEMORYSTATUSEX m{}; (m.dwLength = sizeof(m), GlobalMemoryStatusEx(&m))) return m.ullTotalPhys;
+#elif defined(__APPLE__) || defined(__FreeBSD__) || defined(__NetBSD__) || defined(__OpenBSD__) || defined(__illumos__) || defined(__linux__)
+        if (long p{sysconf(_SC_PHYS_PAGES)}, s{sysconf(_SC_PAGESIZE)}; p > 0 && s > 0) return 1ULL * p * s;
 #endif
-    return std::nullopt;
+        return std::nullopt;
+    }()};
+    return total_ram;
 }
 
-// Obtain the application startup time (used for uptime calculation)
-int64_t GetStartupTime()
-{
-    return nStartupTime;
-}
+namespace {
+    const auto g_startup_time{SteadyClock::now()};
+} // namespace
+
+SteadyClock::duration GetUptime() { return SteadyClock::now() - g_startup_time; }
